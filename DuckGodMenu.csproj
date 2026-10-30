@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <AssemblyName>DuckGodMenu</AssemblyName>
+    <RootNamespace>DuckGodMenu</RootNamespace>
+    <LangVersion>latest</LangVersion>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <DebugType>none</DebugType>
+  </PropertyGroup>
+
+  <!-- ===== IDE ÍRD ÁT: a játék mappája (ahol a Placid Plastic Duck Simulator.exe van) ===== -->
+  <PropertyGroup Condition="'$(GameDir)' == ''">
+    <GameDir>C:\Program Files (x86)\Steam\steamapps\common\Placid Plastic Duck Simulator</GameDir>
+  </PropertyGroup>
+  <!-- Parancssorból is megadható: dotnet build -c Release -p:GameDir="D:\Games\Placid Plastic Duck Simulator" -->
+
+  <ItemGroup>
+    <!-- MelonLoader és az Il2CppInterop: csak a szükséges DLL-ek (nem a teljes net6 mappa, hogy ne legyen CS1705 / CS0433 ütközés) -->
+    <Reference Include="$(GameDir)\MelonLoader\net6\MelonLoader.dll" Private="false" />
+    <Reference Include="$(GameDir)\MelonLoader\net6\0Harmony.dll" Private="false" />
+    <Reference Include="$(GameDir)\MelonLoader\net6\Il2CppInterop.*.dll" Private="false" />
+
+    <!-- A játékból generált Il2Cpp DLL-ek (Assembly-CSharp, UnityEngine.*, Il2Cppmscorlib stb.) -->
+    <!-- A System.* / Microsoft.* / netstandard / mscorlib fájlok kizárva, mert ütköznének az SDK saját könyvtáraival -->
+    <Reference Include="$(GameDir)\MelonLoader\Il2CppAssemblies\*.dll"
+               Exclude="$(GameDir)\MelonLoader\Il2CppAssemblies\System.*.dll;$(GameDir)\MelonLoader\Il2CppAssemblies\Microsoft.*.dll;$(GameDir)\MelonLoader\Il2CppAssemblies\netstandard.dll;$(GameDir)\MelonLoader\Il2CppAssemblies\mscorlib.dll"
+               Private="false" />
+  </ItemGroup>
+
+  <!-- Fordítás után a DLL automatikusan a Mods mappába másolódik, ha az létezik -->
+  <Target Name="CopyToMods" AfterTargets="Build" Condition="Exists('$(GameDir)\Mods')">
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(GameDir)\Mods" />
+    <Message Importance="high" Text="Bemasolva: $(GameDir)\Mods\$(TargetFileName)" />
+  </Target>
+
+</Project>
