@@ -327,6 +327,8 @@ namespace DuckGodMenu
         private bool _isHostOrSolo = true;
         private float _nextHostCheck = 0f;
         private bool _hostStateKnown = false;
+        private string _lastHostStateKey = "";
+        private bool _isMultiplayer = false; // a hálózati munkamenet nem egyjátékos
 
         private bool IsHostOrSolo()
         {
@@ -334,6 +336,7 @@ namespace DuckGodMenu
             _nextHostCheck = Time.unscaledTime + 1f;
 
             bool allowed = true;
+            bool multi = false;
             string why = "nincs GeneralManager (főmenü vagy betöltés)";
             try
             {
@@ -354,6 +357,7 @@ namespace DuckGodMenu
                         else if (single == null && server == null && master == null) why = "a host-állapot nem olvasható (engedélyezve)";
                         else
                         {
+                            multi = single is bool sg && !sg && !(running is bool rg && !rg);
                             allowed = (single is bool sb && sb) || (server is bool vb && vb) || (master is bool mb && mb);
                             why = $"IsSinglePlayer={single}, IsServer={server}, IsSharedModeMasterClient={master}";
                         }
@@ -366,16 +370,113 @@ namespace DuckGodMenu
                 why = "hiba az ellenőrzésnél: " + ex.Message;
             }
 
-            if (!_hostStateKnown || allowed != _isHostOrSolo)
-                LoggerInstance.Msg($"[NET] Host/egyjátékos: {(allowed ? "IGEN - a menü elérhető" : "NEM - a menü le van tiltva")} ({why})");
+            string stateKey = $"{allowed}|{multi}|{why}";
+            if (!_hostStateKnown || stateKey != _lastHostStateKey)
+            {
+                _lastHostStateKey = stateKey;
+                LoggerInstance.Msg($"[NET] Host/egyjátékos: {(allowed ? "IGEN - a menü elérhető" : "NEM - a menü le van tiltva")}, multiplayer: {multi} ({why})");
+            }
             _hostStateKnown = true;
             _isHostOrSolo = allowed;
+            _isMultiplayer = multi;
             return allowed;
+        }
+
+        // ---- Multiplayer jelzés: a szerver moddal fut ----
+        // A többi játékosnál nincs mod, ezért a jelzésnek a játék saját hálózatán kell eljutnia hozzájuk: a host kacsájának
+        // neve elé "[MOD] " kerül (a név hálózati érték, így mindenki látja a kacsa fölött). Kilépéskor / egyjátékos módba váltáskor visszaáll.
+        private const string ModTag = "[MOD] ";
+        private const bool _modNoticeEnabled = true; // szándékosan nem kapcsolható ki a menüből
+        private DuckManager _modNoticeDuck = null;
+        private string _modNoticeOrigName = null;
+        private float _nextModNotice = 0f;
+
+        private void RestoreModNotice()
+        {
+            try
+            {
+                if (_modNoticeDuck != null && _modNoticeOrigName != null)
+                {
+                    SetMemberValue(_modNoticeDuck, "DisplayName", _modNoticeOrigName);
+                    LoggerInstance.Msg($"[NET] [MOD] jelzés levéve a kacsáról, név visszaállítva: {_modNoticeOrigName}");
+                }
+            }
+            catch (System.Exception ex) { LogErrorOnce($"[NET] Név visszaállítása sikertelen: {ex.Message}"); }
+            _modNoticeDuck = null;
+            _modNoticeOrigName = null;
+        }
+
+        private string _lastNoticeReason = "";
+        private void NoticeReason(string r)
+        {
+            if (r == _lastNoticeReason) return;
+            _lastNoticeReason = r;
+            LoggerInstance.Msg("[NET] Mod-jelzés: " + r);
+        }
+
+        private static DuckManager AsDuckManager(object o)
+        {
+            if (o == null) return null;
+            if (o is DuckManager dm) return dm;
+            if (o is GameObject go) return go.GetComponent<DuckManager>();
+            if (o is Component c) return c.GetComponent<DuckManager>();
+            return null;
+        }
+
+        private void UpdateModNotice()
+        {
+            if (Time.unscaledTime < _nextModNotice) return;
+            _nextModNotice = Time.unscaledTime + 2f;
+            try
+            {
+                if (!_modNoticeEnabled || !_isMultiplayer)
+                {
+                    if (_modNoticeDuck != null) RestoreModNotice();
+                    NoticeReason("nem multiplayer (vagy még nincs hálózati munkamenet), nincs mit jelezni.");
+                    return;
+                }
+
+                GeneralManager gm = GeneralManager.I;
+                if (gm == null) { NoticeReason("GeneralManager.I == null"); return; }
+
+                DuckManager mine = null;
+                var tried = new List<string>();
+                foreach (var name in new[] { "playerDuck", "CurrentDuck", "currentDuck", "LocalPlayer", "_playerGame" })
+                {
+                    object v = GetMemberValue(gm, typeof(GeneralManager), name);
+                    mine = AsDuckManager(v);
+                    tried.Add($"{name}={(v == null ? "null" : v.GetType().Name)}{(mine != null ? "(OK)" : "")}");
+                    if (mine != null) break;
+                }
+                if (mine == null) { NoticeReason("nem találom a host kacsáját: " + string.Join(", ", tried)); return; }
+
+                if (_modNoticeDuck != null && _modNoticeDuck.Pointer != mine.Pointer) RestoreModNotice(); // másik kacsára váltottál
+
+                string cur = GetMemberValue(mine, typeof(DuckManager), "DisplayName")?.ToString();
+                if (cur == null) { NoticeReason("a kacsa DisplayName értéke nem olvasható."); return; }
+                if (cur.StartsWith(ModTag)) { NoticeReason("a jelzés rajta van: " + cur); return; }
+
+                _modNoticeDuck = mine;
+                _modNoticeOrigName = cur;
+                if (SetMemberValue(mine, "DisplayName", ModTag + cur))
+                {
+                    string after = GetMemberValue(mine, typeof(DuckManager), "DisplayName")?.ToString();
+                    NoticeReason($"jelzés kitéve: '{cur}' -> '{after}' (kacsa: {mine.name}, találat: {string.Join(", ", tried)})");
+                }
+                else { NoticeReason("a kacsa DisplayName értéke nem írható."); _modNoticeDuck = null; _modNoticeOrigName = null; }
+            }
+            catch (System.Exception ex) { LogErrorOnce($"[NET] Mod-jelzés hiba: {ex.GetType().Name}: {ex.Message}"); }
+        }
+
+        public override void OnApplicationQuit()
+        {
+            RestoreModNotice();
         }
 
         public override void OnUpdate()
         {
             if (!IsHostOrSolo()) return;
+            UpdateModNotice();
             CheckSaveResult();
             try
             {
@@ -1432,6 +1533,7 @@ namespace DuckGodMenu
             SafeSpace(10);
             SafeLabel(T("System Commands", "Rendszer Parancsok"), _headerStyle);
 
+
             _chaosModeActive = SafeToggle(_chaosModeActive, T("Chaos Flood", "Káosz Özön"), _customBtnStyle);
             if (SafeButton(T("Quick Spawn", "Gyors Spawn"), _customBtnStyle))
             {
@@ -2451,6 +2553,7 @@ namespace DuckGodMenu
             new[] { "Weather buttons", "Időjárás gombok", "Clear sky, Rain, Snow and Fog change the weather through the game's Enviro system. Fog uses the closest weather type this game has (Cloudy 3). Without Enviro, only Fog and Clear sky work (basic fog).", "A Tiszta ég, Eső, Hó és Köd a játék Enviro rendszerén át váltja az időjárást. Enviro nélkül csak a Köd és a Tiszta ég működik (egyszerű köd)." },
             new[] { "Clear ALL weather", "Minden időjárás törlése", "Instantly switches to Clear sky and restores the original fog (undoes Fog/Rain/Snow).", "Azonnal tiszta égre vált, és visszaállítja az eredeti ködöt (visszavonja a Köd/Eső/Hó hatását)." },
             new[] { "Chaos Flood", "Káosz Özön", "Spawns a duck every 0.15 s until 50 ducks exist, then switches itself off.", "0,15 másodpercenként spawnol egy kacsát, amíg 50 kacsa nincs, utána magától kikapcsol." },
+            new[] { "[MOD] tag (multiplayer)", "[MOD] jelzés (multiplayer)", "When you host a multiplayer game, \"[MOD] \" is put in front of your duck's name so other players can see the server is modded. It cannot be turned off while hosting; the name is restored when you leave.", "Multiplayer hostolásnál a kacsád neve elé \"[MOD] \" kerül, hogy a többi játékos lássa, hogy a szerver moddal fut. Hostolás közben nem kapcsolható ki; kilépéskor a név visszaáll." },
             new[] { "Quick Spawn", "Gyors Spawn", "Spawns one random duck.", "Egy véletlen kacsát spawnol." },
             new[] { "DELETE ALL DUCKS", "MINDEN KACSA TÖRLÉSE", "Deletes every duck. It needs two clicks within 3 seconds.", "Törli az összes kacsát. 3 másodpercen belül két kattintás kell hozzá." },
             new[] { "Force Save", "Kényszerített Mentés", "Saves the game into a dedicated slot. The first press picks a free slot and remembers it. It checks after 3 seconds that the slot exists.", "Egy külön slotba menti a játékot. Az első megnyomás szabad slotot választ és megjegyzi. 3 másodperc múlva ellenőrzi, hogy létrejött-e." },
