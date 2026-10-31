@@ -3,8 +3,7 @@
 //  - NEW: Kacsa Klónozó: a "Kacsaválasztó" bekapcsolva bal klikkel kijelölhető egy kacsa (ha nem találja el a sugár, a kurzorhoz
 //           képernyőn legközelebbi, 60 pixelen belüli kacsát választja), a "Kijelölt kacsa klónozása" gombbal egy ugyanolyan kacsa
 //           jelenik meg fölötte. A klón az eredeti (nem szorzott) méretet kapja, így a Testméret csúszkával sem szorzódik kétszer
-//  - NEW: Időjárás és Évszak: Tiszta ég / Eső / Hó / Köd / Vihar és Tavasz / Nyár / Ősz / Tél gombok. A játék Enviro rendszerét
-//           reflexióval éri el (EnviroManager.instance.Weather.ChangeWeather / Environment.ChangeSeason), mert a pontos API-t nem ismerjük.
+//  - NEW: Időjárás: Tiszta ég / Eső / Hó / Köd / Minden időjárás törlése gombok. Klónozás a játék saját spawnolásával (nem süllyed le).
 //           Ha az Enviro nem érhető el, a Köd és a Tiszta ég a RenderSettings ködjére esik vissza. Az elérhető időjárás-típusok és
 //           metódusok a naplóba kerülnek ([WEATHER-DIAG])
 //  - NEW: Gravitációs Fegyver: bekapcsolva a jobb klikk a legközelebbi kacsát a kurzor alatti pontra teleportálja (sebesség nullázva).
@@ -322,8 +321,61 @@ namespace DuckGodMenu
             return _windowRect.Contains(p) || (_showGuide && _guideRect.Contains(p));
         }
 
+        // ---- Multiplayer védelem ----
+        // Multiplayerben a mod csak a hosztnál (vagy egyjátékos módban) működik: kliensként nem jelenik meg a menü,
+        // és semmilyen funkció nem fut, hogy ne nyúljunk bele más játékosok hálózati objektumaiba.
+        private bool _isHostOrSolo = true;
+        private float _nextHostCheck = 0f;
+        private bool _hostStateKnown = false;
+
+        private bool IsHostOrSolo()
+        {
+            if (Time.unscaledTime < _nextHostCheck) return _isHostOrSolo;
+            _nextHostCheck = Time.unscaledTime + 1f;
+
+            bool allowed = true;
+            string why = "nincs GeneralManager (főmenü vagy betöltés)";
+            try
+            {
+                GeneralManager gm = GeneralManager.I;
+                if (gm != null)
+                {
+                    object runner = GetMemberValue(gm, typeof(GeneralManager), "Runner");
+                    if (runner == null) why = "nincs NetworkRunner (egyjátékos)";
+                    else
+                    {
+                        var rt = runner.GetType();
+                        object running = GetMemberValue(runner, rt, "IsRunning");
+                        object single = GetMemberValue(runner, rt, "IsSinglePlayer");
+                        object server = GetMemberValue(runner, rt, "IsServer");
+                        object master = GetMemberValue(runner, rt, "IsSharedModeMasterClient");
+
+                        if (running is bool rb && !rb) why = "a NetworkRunner nem fut";
+                        else if (single == null && server == null && master == null) why = "a host-állapot nem olvasható (engedélyezve)";
+                        else
+                        {
+                            allowed = (single is bool sb && sb) || (server is bool vb && vb) || (master is bool mb && mb);
+                            why = $"IsSinglePlayer={single}, IsServer={server}, IsSharedModeMasterClient={master}";
+                        }
+                    }
+                }
+            }
+            catch (System.Exception ex)
+            {
+                allowed = true; // hiba esetén nem zárjuk ki az egyjátékos módot
+                why = "hiba az ellenőrzésnél: " + ex.Message;
+            }
+
+            if (!_hostStateKnown || allowed != _isHostOrSolo)
+                LoggerInstance.Msg($"[NET] Host/egyjátékos: {(allowed ? "IGEN - a menü elérhető" : "NEM - a menü le van tiltva")} ({why})");
+            _hostStateKnown = true;
+            _isHostOrSolo = allowed;
+            return allowed;
+        }
+
         public override void OnUpdate()
         {
+            if (!IsHostOrSolo()) return;
             CheckSaveResult();
             try
             {
@@ -358,6 +410,7 @@ namespace DuckGodMenu
                     if (_cachedMainCamera == null) UpdateCameraCache(); // jelenetváltás után is újra megkeresi
                     UpdateDuckCache();
                 }
+                ProcessPendingClone();
 
                 if (_chaosModeActive && Time.time > _nextChaosSpawnTime)
                 {
@@ -401,6 +454,7 @@ namespace DuckGodMenu
 
         public override void OnLateUpdate()
         {
+            if (!IsHostOrSolo()) return;
             try
             {
                 // Repülés közben a Kamera Követés szünetel
@@ -449,6 +503,7 @@ namespace DuckGodMenu
 
         public override void OnFixedUpdate()
         {
+            if (!IsHostOrSolo()) return;
             try
             {
                 if (_cachedDucks.Count == 0) return;
@@ -1014,6 +1069,7 @@ namespace DuckGodMenu
 
         public override void OnGUI()
         {
+            if (!IsHostOrSolo()) return;
             try
             {
                 if (!_diagOnGuiLogged)
@@ -1362,18 +1418,13 @@ namespace DuckGodMenu
             }
 
             // ---- 5. IDŐJÁRÁS ÉS ÉVSZAK ----
-            if (Section(5, T("5. Weather & Season", "5. Időjárás és Évszak")))
+            if (Section(5, T("5. Weather", "5. Időjárás")))
             {
                 if (SafeButton(T("Clear sky", "Tiszta ég"), _customBtnStyle)) SetWeather("clear");
                 if (SafeButton(T("Rain", "Eső"), _customBtnStyle)) SetWeather("rain");
                 if (SafeButton(T("Snow", "Hó"), _customBtnStyle)) SetWeather("snow");
                 if (SafeButton(T("Fog", "Köd"), _customBtnStyle)) SetWeather("fog");
-                if (SafeButton(T("Storm", "Vihar"), _customBtnStyle)) SetWeather("storm");
                 if (SafeButton(T("Clear ALL weather", "Minden időjárás törlése"), _customBtnStyle)) ClearAllWeather();
-                if (SafeButton(T("Season: Spring", "Évszak: Tavasz"), _customBtnStyle)) SetSeason("Spring");
-                if (SafeButton(T("Season: Summer", "Évszak: Nyár"), _customBtnStyle)) SetSeason("Summer");
-                if (SafeButton(T("Season: Autumn", "Évszak: Ősz"), _customBtnStyle)) SetSeason("Autumn");
-                if (SafeButton(T("Season: Winter", "Évszak: Tél"), _customBtnStyle)) SetSeason("Winter");
                 SafeLabel(string.IsNullOrEmpty(_weatherStatus) ? " " : _weatherStatus);
             }
 
@@ -1903,6 +1954,12 @@ namespace DuckGodMenu
             catch (System.Exception ex) { LogErrorOnce($"[CLONE] Kacsa kijelölése sikertelen: {ex.GetType().Name}: {ex.Message}"); }
         }
 
+        // A klónozott kacsa a játék saját spawnolásával jön létre (Fusion hálózati objektum). A sima Object.Instantiate
+        // másolat nincs regisztrálva a hálózatban, így a FixedUpdateNetwork-ben futó felhajtóerő nem hat rá, és lesüllyed.
+        private HashSet<int> _cloneKnownIds = null;
+        private Vector3 _clonePendingPos;
+        private float _clonePendingUntil = 0f;
+
         private void CloneSelectedDuck()
         {
             try
@@ -1913,6 +1970,24 @@ namespace DuckGodMenu
                     return;
                 }
 
+                string duckId = null;
+                try { duckId = GetMemberValue(_selectedDuck, typeof(DuckManager), "duckID")?.ToString(); } catch { }
+                GeneralManager gm = GeneralManager.I;
+
+                if (gm != null && !string.IsNullOrEmpty(duckId))
+                {
+                    var known = new HashSet<int>();
+                    foreach (var d in _cachedDucks) known.Add(d.id);
+                    _cloneKnownIds = known;
+                    _clonePendingPos = _selectedDuck.transform.position + new Vector3(0f, 1.5f, 0f);
+                    _clonePendingUntil = Time.unscaledTime + 5f;
+                    gm.DebugSpawnDuck(duckId);
+                    _nextCacheUpdateTime = 0f;
+                    LoggerInstance.Msg($"[CLONE] {duckId} spawnolva a játék saját spawnolásával.");
+                    return;
+                }
+
+                LoggerInstance.Msg("[CLONE] A játék spawnolása nem elérhető (duckID/GeneralManager), sima másolat készül (süllyedhet).");
                 GameObject src = _selectedDuck.gameObject;
                 Vector3 pos = _selectedDuck.transform.position + new Vector3(0f, 1.5f, 0f);
                 GameObject copy = Object.Instantiate<GameObject>(src, pos, _selectedDuck.transform.rotation);
@@ -1921,30 +1996,30 @@ namespace DuckGodMenu
                     LogErrorOnce("[CLONE] Az Instantiate nem adott vissza objektumot.");
                     return;
                 }
-
-                // A klón az EREDETI méretet és renderer-állapotot kapja (a Testméret / Ghost újra rá lesz alkalmazva a következő szkennelésnél)
-                if (_duckById.TryGetValue(_selectedDuckId, out DuckData sd))
-                {
-                    copy.transform.localScale = sd.origScale;
-                    var rends = copy.GetComponentsInChildren<Renderer>();
-                    if (rends != null && sd.origRendEnabled != null && rends.Count == sd.origRendEnabled.Count)
-                    {
-                        for (int i = 0; i < rends.Count; i++)
-                            if (rends[i] != null) rends[i].enabled = sd.origRendEnabled[i];
-                    }
-                }
-
-                Rigidbody rb = copy.GetComponent<Rigidbody>();
-                if (rb != null && !rb.isKinematic)
-                {
-                    rb.velocity = Vector3.zero;
-                    rb.angularVelocity = Vector3.zero;
-                }
-
-                _nextCacheUpdateTime = 0f; // a következő képkockában regisztrálja a klónt
-                LoggerInstance.Msg($"[CLONE] {_selectedDuck.name} klónozva.");
+                _nextCacheUpdateTime = 0f;
+                LoggerInstance.Msg($"[CLONE] {_selectedDuck.name} klónozva (másolat).");
             }
             catch (System.Exception ex) { LogErrorOnce($"[CLONE] Klónozás sikertelen: {ex.GetType().Name}: {ex.Message}"); }
+        }
+
+        // Az újonnan spawnolt kacsát az eredeti fölé teszi (a játék a saját spawn-pontján hozza létre)
+        private void ProcessPendingClone()
+        {
+            if (_cloneKnownIds == null) return;
+            if (Time.unscaledTime > _clonePendingUntil) { _cloneKnownIds = null; return; }
+            foreach (var d in _cachedDucks)
+            {
+                if (d.gameObject == null || _cloneKnownIds.Contains(d.id)) continue;
+                d.transform.position = _clonePendingPos;
+                if (d.rigidbody != null && !d.rigidbody.isKinematic)
+                {
+                    d.rigidbody.velocity = Vector3.zero;
+                    d.rigidbody.angularVelocity = Vector3.zero;
+                }
+                _cloneKnownIds = null;
+                return;
+            }
+            _nextCacheUpdateTime = 0f; // még nem jelent meg, a következő képkockában újra keresünk
         }
 
         // ---- Gravitációs Fegyver ----
@@ -2344,45 +2419,6 @@ namespace DuckGodMenu
                     : T("Enviro weather system not found (see the log).", "Az Enviro időjárás-rendszer nem található (lásd a naplót).");
         }
 
-        private void SetSeason(string key)
-        {
-            try
-            {
-                if (EnsureEnviro() && _enviroEnvModule != null)
-                {
-                    foreach (var m in _enviroEnvModule.GetType().GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance))
-                    {
-                        if (m.Name != "ChangeSeason") continue;
-                        var ps = m.GetParameters();
-                        if (ps.Length != 1 || !ps[0].ParameterType.IsEnum) continue;
-
-                        string match = null;
-                        foreach (var n in System.Enum.GetNames(ps[0].ParameterType))
-                            if (string.Equals(n, key, System.StringComparison.OrdinalIgnoreCase)) { match = n; break; }
-                        if (match == null) continue;
-
-                        // az automatikus évszakváltás felülírná a kézi választást
-                        try
-                        {
-                            object st = GetMemberValue(_enviroEnvModule, _enviroEnvModule.GetType(), "Settings");
-                            if (st != null) SetMemberValue(st, "changeSeason", false);
-                        }
-                        catch { }
-                        m.Invoke(_enviroEnvModule, new object[] { System.Enum.Parse(ps[0].ParameterType, match) });
-                        _weatherStatus = T("Season: ", "Évszak: ") + match;
-                        LogWeatherState($"SetSeason({key})");
-                        return;
-                    }
-                }
-                _weatherStatus = T("Season change not available (see the log).", "Az évszakváltás nem elérhető (lásd a naplót).");
-            }
-            catch (System.Exception ex)
-            {
-                _weatherStatus = T("Season change failed: ", "Évszakváltás sikertelen: ") + ex.Message;
-                LogErrorOnce($"[WEATHER] SetSeason({key}) hiba: {ex.GetType().Name}: {ex.Message}");
-            }
-        }
-
         // ---- Útmutató ----
         // {angol cím, magyar cím, angol leírás, magyar leírás}
         private static readonly string[][] GuideEntries = new string[][]
@@ -2412,9 +2448,8 @@ namespace DuckGodMenu
             new[] { "Camera Follow", "Kamera Követés", "The camera follows a duck. Next Duck switches the target. Turning it off restores the camera.", "A kamera egy kacsát követ. A Következő Kacsa váltja a célpontot. Kikapcsoláskor visszaáll a kamera." },
             new[] { "Free Camera", "Szabad Kamera", "Enable it, then Space starts and stops flying. WASD moves, Q/E down/up, Shift is fast, hold right mouse to look. Exiting restores the camera.", "Kapcsold be, utána a Space indítja és állítja le a repülést. WASD mozgás, Q/E le/fel, Shift gyors, jobb egérgomb nyomva = nézelődés. Kilépéskor visszaáll a kamera." },
             new[] { "Rescue Lost Ducks", "Eltűnt Kacsák Visszahozása", "Ducks that fall 60 units below, get 300 units away or get an invalid position are put back to their first position.", "A 60 egységet lezuhant, 300 egységnél messzebb jutott vagy érvénytelen helyű kacsák visszakerülnek az első helyükre." },
-            new[] { "Weather buttons", "Időjárás gombok", "Clear sky, Rain, Snow, Fog and Storm change the weather through the game's Enviro system. Fog and Storm use the closest weather type this game has (Cloudy 3 / Rain). Without Enviro, only Fog and Clear sky work (basic fog).", "A Tiszta ég, Eső, Hó, Köd és Vihar a játék Enviro rendszerén át váltja az időjárást. Enviro nélkül csak a Köd és a Tiszta ég működik (egyszerű köd)." },
-            new[] { "Clear ALL weather", "Minden időjárás törlése", "Instantly switches to Clear sky and restores the original fog (undoes Fog/Rain/Snow/Storm).", "Azonnal tiszta égre vált, és visszaállítja az eredeti ködöt (visszavonja a Köd/Eső/Hó/Vihar hatását)." },
-            new[] { "Season buttons", "Évszak gombok", "Spring, Summer, Autumn and Winter change the season through Enviro, if the game supports it.", "A Tavasz, Nyár, Ősz és Tél az Enviro-n át váltja az évszakot, ha a játék támogatja." },
+            new[] { "Weather buttons", "Időjárás gombok", "Clear sky, Rain, Snow and Fog change the weather through the game's Enviro system. Fog uses the closest weather type this game has (Cloudy 3). Without Enviro, only Fog and Clear sky work (basic fog).", "A Tiszta ég, Eső, Hó és Köd a játék Enviro rendszerén át váltja az időjárást. Enviro nélkül csak a Köd és a Tiszta ég működik (egyszerű köd)." },
+            new[] { "Clear ALL weather", "Minden időjárás törlése", "Instantly switches to Clear sky and restores the original fog (undoes Fog/Rain/Snow).", "Azonnal tiszta égre vált, és visszaállítja az eredeti ködöt (visszavonja a Köd/Eső/Hó hatását)." },
             new[] { "Chaos Flood", "Káosz Özön", "Spawns a duck every 0.15 s until 50 ducks exist, then switches itself off.", "0,15 másodpercenként spawnol egy kacsát, amíg 50 kacsa nincs, utána magától kikapcsol." },
             new[] { "Quick Spawn", "Gyors Spawn", "Spawns one random duck.", "Egy véletlen kacsát spawnol." },
             new[] { "DELETE ALL DUCKS", "MINDEN KACSA TÖRLÉSE", "Deletes every duck. It needs two clicks within 3 seconds.", "Törli az összes kacsát. 3 másodpercen belül két kattintás kell hozzá." },
@@ -2461,6 +2496,7 @@ namespace DuckGodMenu
             if (SafeButton(T("< Previous", "< Előző"), _customBtnStyle)) _guidePage = page > 0 ? page - 1 : pages - 1;
             if (SafeButton(T("Next >", "Következő >"), _customBtnStyle)) _guidePage = page < pages - 1 ? page + 1 : 0;
 
+            DrawMenuCursor(); // az útmutatón is látszódjon a négyzet-kurzor
             try { GUI.DragWindow(new Rect(0, 0, 10000, 20)); }
             catch (System.Exception ex) { GuiFail("GUI.DragWindow(guide)", ex); }
         }
