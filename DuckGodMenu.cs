@@ -316,9 +316,529 @@ namespace DuckGodMenu
         // Az egér a menüablak fölött van-e (hogy a játékbeli eszközök ne reagáljanak a menü kattintásaira)
         private bool MouseOverMenu()
         {
-            if (!_showMenu) return false;
+            if (!_showMenu || _screenshotMode) return false;
             Vector2 p = new Vector2(Input.mousePosition.x, Screen.height - Input.mousePosition.y);
             return _windowRect.Contains(p) || (_showGuide && _guideRect.Contains(p));
+        }
+
+        // ================= v8: menü-billentyű, Rescue javítás, Respawn All, kacsa-védelem, Opt/Camera extrák =================
+        private KeyCode _menuKey = KeyCode.F9;
+        private bool _rebindingMenuKey = false;
+        private const string PrefMenuKey = "DuckGodMenu_MenuKey";
+
+        private void LoadMenuKey()
+        {
+            try
+            {
+                int v = PlayerPrefs.GetInt(PrefMenuKey, (int)KeyCode.F9);
+                _menuKey = System.Enum.IsDefined(typeof(KeyCode), v) ? (KeyCode)v : KeyCode.F9;
+            }
+            catch { _menuKey = KeyCode.F9; }
+        }
+
+        // Az új menü-billentyű rögzítése az IMGUI KeyDown eseményből (OnGUI)
+        private void CaptureMenuKey()
+        {
+            if (!_rebindingMenuKey) return;
+            Event e = Event.current;
+            if (e == null || e.type != EventType.KeyDown) return;
+            KeyCode kc = e.keyCode;
+            if (kc == KeyCode.None) return;
+            e.Use();
+            _rebindingMenuKey = false;
+            if (kc == KeyCode.Escape) return; // mégse
+            if (kc == KeyCode.F8 || kc == KeyCode.Space || kc >= KeyCode.Mouse0)
+            {
+                LoggerInstance.Msg($"[KEY] A(z) {kc} nem használható menü-billentyűnek (foglalt vagy egérgomb).");
+                return;
+            }
+            _menuKey = kc;
+            try { PlayerPrefs.SetInt(PrefMenuKey, (int)kc); PlayerPrefs.Save(); } catch { }
+            LoggerInstance.Msg($"[KEY] Új menü-billentyű: {kc}");
+        }
+
+        // ---- Rescue Lost Ducks (javított) ----
+        // Okok, amiért régen az összes kacsát újra és újra visszadobta: a tó nagy (a kacsák 300+ egységet sodródnak az első helyzetüktől),
+        // a repülő kacsák (Propeller, HatProp) magasra szállnak, a levegőben spawnolt kacsák lezuhannak a vízre, és a
+        // más területeken (Hippospace, tető, romok...) lévő kacsák is "elveszettnek" látszottak.
+        private const float LakeLevelGuess = -20f;       // a napló szerint a víz kb. ebben a magasságban van
+        private const float RescueCooldown = 10f;        // ugyanazt a kacsát ennyi másodpercenként legfeljebb egyszer
+        private const float RescueMassFraction = 0.3f;   // ha egyszerre ennyi kacsa "elveszett", a szabály hibás: nem nyúlunk hozzájuk
+        private readonly Dictionary<int, float> _lastRescueTime = new Dictionary<int, float>();
+        private bool _rescueMassLogged = false;
+        private float _rescueDespawnSq = 0f;             // a játék saját despawn-távolsága (négyzet)
+
+        private bool IsInOtherZone(DuckData d)
+        {
+            // más területen (Hippospace, tető, romok, téli jelenet, évszak-konténer) lévő kacsa nem elveszett
+            string[] flags = { "isInHippospace", "isInRooftop", "isInRuins", "isInWinterScene", "isInInfinityCool", "IsInSeasonContainer" };
+            foreach (var f in flags)
+            {
+                object v = GetMemberValue(d.manager, typeof(DuckManager), f);
+                if (v is bool b && b) return true;
+            }
+            return false;
+        }
+
+        // Respawn All Ducks: minden kezelhető kacsa a játék saját spawn-pontjára kerül (megerősítéssel)
+        private float _respawnArmedUntil = 0f;
+        private string _respawnStatus = "";
+
+        private void RespawnAllDucks()
+        {
+            try
+            {
+                if (Time.unscaledTime > _respawnArmedUntil)
+                {
+                    _respawnArmedUntil = Time.unscaledTime + 4f;
+                    _respawnStatus = T("Click again within 4 s to confirm.", "Kattints újra 4 mp-en belül a megerősítéshez.");
+                    return;
+                }
+                _respawnArmedUntil = 0f;
+
+                GeneralManager gm = GeneralManager.I;
+                int n = 0;
+                for (int i = 0; i < _cachedDucks.Count; i++)
+                {
+                    DuckData d = _cachedDucks[i];
+                    if (d.gameObject == null || d.transform == null) continue;
+
+                    bool moved = false;
+                    if (gm != null)
+                    {
+                        try { gm.MoveDuckToSpawnPoint(d.gameObject); moved = true; }
+                        catch (System.Exception ex) { LogErrorOnce($"[RESPAWN] MoveDuckToSpawnPoint hiba: {ex.GetType().Name}: {ex.Message}"); }
+                    }
+                    if (!moved && !IsInvalid(d.firstPos)) d.transform.position = d.firstPos;
+
+                    // kis szórás, hogy ne ugyanabba a pontba kerüljön az összes kacsa
+                    d.transform.position += new Vector3(Random.Range(-2f, 2f), Random.Range(0f, 3f), Random.Range(-2f, 2f));
+                    if (d.rigidbody != null && !d.rigidbody.isKinematic)
+                    {
+                        d.rigidbody.velocity = Vector3.zero;
+                        d.rigidbody.angularVelocity = Vector3.zero;
+                    }
+                    d.firstPos = d.transform.position;
+                    _cachedDucks[i] = d;
+                    _duckById[d.id] = d;
+                    n++;
+                }
+                _respawnStatus = T("Respawned: ", "Visszahelyezve: ") + n;
+                LoggerInstance.Msg($"[RESPAWN] {n} kacsa a spawn-pontra került.");
+            }
+            catch (System.Exception ex)
+            {
+                _respawnStatus = T("Respawn failed: ", "Respawn sikertelen: ") + ex.Message;
+                LogErrorOnce($"[RESPAWN] Hiba: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        // ---- Kacsa-védelem (csak egyjátékos módban) ----
+        // A védett kacsát a mod nem látja (a cache-ből kimarad), és a játék saját despawn-távolsága is hatalmasra van állítva.
+        private readonly HashSet<int> _protectedIds = new HashSet<int>();
+        private readonly Dictionary<int, float> _protectedOrigDespawn = new Dictionary<int, float>();
+        private readonly Dictionary<int, DuckManager> _protectedDucks = new Dictionary<int, DuckManager>();
+        private string _protectStatus = "";
+
+        private void RestoreDuckDefaults(DuckData d)
+        {
+            if (d.gameObject == null) return;
+            if (d.rigidbody != null)
+            {
+                d.rigidbody.drag = d.origDrag;
+                d.rigidbody.angularDrag = d.origAngDrag;
+                d.rigidbody.useGravity = d.origGravity;
+            }
+            ApplyGhost(d, false);
+            if (d.transform != null) d.transform.localScale = d.origScale;
+            if (d.renderer != null && _discoStates.TryGetValue(d.id, out DiscoState st))
+            {
+                d.renderer.SetPropertyBlock(st.orig);
+                _discoStates.Remove(d.id);
+            }
+        }
+
+        private void ToggleProtectSelected()
+        {
+            try
+            {
+                if (_isMultiplayer) { _protectStatus = T("Singleplayer only.", "Csak egyjátékos módban."); return; }
+                if (_selectedDuck == null) { _protectStatus = T("Select a duck with the Duck Picker first.", "Előbb válassz egy kacsát a Kacsaválasztóval."); return; }
+
+                int id = _selectedDuck.GetInstanceID();
+                if (_protectedIds.Contains(id)) { Unprotect(id); _protectStatus = T("Protection removed: ", "Védelem levéve: ") + _selectedDuck.name; return; }
+
+                if (_duckById.TryGetValue(id, out DuckData d)) RestoreDuckDefaults(d); // a mod eddigi módosításai lekerülnek róla
+                _protectedIds.Add(id);
+                _protectedDucks[id] = _selectedDuck;
+                try
+                {
+                    object orig = GetMemberValue(_selectedDuck, typeof(DuckManager), "squareDistanceToDespawn");
+                    if (orig != null && !_protectedOrigDespawn.ContainsKey(id)) _protectedOrigDespawn[id] = System.Convert.ToSingle(orig);
+                    SetMemberValue(_selectedDuck, "squareDistanceToDespawn", 1e12f); // a játék ne despawnolja
+                }
+                catch { }
+                _cachedDucks.RemoveAll(x => x.id == id);
+                _duckById.Remove(id);
+                _protectStatus = T("Protected: ", "Védett: ") + _selectedDuck.name;
+                LoggerInstance.Msg($"[PROTECT] Védett kacsa: {_selectedDuck.name}");
+            }
+            catch (System.Exception ex) { _protectStatus = T("Protect failed: ", "Védelem sikertelen: ") + ex.Message; LogErrorOnce($"[PROTECT] Hiba: {ex.Message}"); }
+        }
+
+        private void Unprotect(int id)
+        {
+            try
+            {
+                if (_protectedDucks.TryGetValue(id, out DuckManager dm) && dm != null && _protectedOrigDespawn.TryGetValue(id, out float orig))
+                    SetMemberValue(dm, "squareDistanceToDespawn", orig);
+            }
+            catch { }
+            _protectedIds.Remove(id);
+            _protectedDucks.Remove(id);
+            _protectedOrigDespawn.Remove(id);
+            _nextCacheUpdateTime = 0f; // a kacsa a következő képkockában visszakerül a cache-be
+        }
+
+        private void UnprotectAll()
+        {
+            var ids = new List<int>(_protectedIds);
+            foreach (int id in ids) Unprotect(id);
+        }
+
+        // ---- Optimization Mode extrák ----
+        private float CurrentCacheInterval()
+        {
+            if (!_optimizationMode) return CacheInterval;
+            int n = _cachedDucks.Count;
+            return n > 120 ? 5f : (n > 60 ? 3.5f : CacheInterval); // sok kacsánál ritkábban fut a (drága) teljes keresés
+        }
+
+        // ---- Better Camera Mode extrák ----
+        private bool _autoOrbit = false;
+        private bool _cinematic = false;
+        private float _nextCinematicSwitch = 0f;
+
+        private void UpdateCameraExtras()
+        {
+            if (!_betterCameraMode || !_cameraFollowActive || _cachedDucks.Count == 0) return;
+            if (Input.GetKeyDown(KeyCode.PageDown)) _cameraTargetIndex++;
+            if (Input.GetKeyDown(KeyCode.PageUp)) _cameraTargetIndex = _cameraTargetIndex > 0 ? _cameraTargetIndex - 1 : _cachedDucks.Count - 1;
+            if (Input.GetKeyDown(KeyCode.Home)) _autoOrbit = !_autoOrbit;
+            if (Input.GetKeyDown(KeyCode.End)) { _cinematic = !_cinematic; _nextCinematicSwitch = Time.unscaledTime + 12f; }
+            if (_cinematic && Time.unscaledTime > _nextCinematicSwitch)
+            {
+                _nextCinematicSwitch = Time.unscaledTime + 12f;
+                _cameraTargetIndex = Random.Range(0, _cachedDucks.Count);
+            }
+        }
+
+        // ================= v7: Optimization Mode, Better Camera Mode, Spawner, Formációk, Multiplayer védelem =================
+        private bool _optimizationMode = false;
+        private bool _betterCameraMode = false;
+        private bool _collectionSpawner = false;
+        private bool _screenshotMode = false;
+        private bool _mpUi = false;                 // az _isMultiplayer másolata, csak OnUpdate-ben frissül (stabil IMGUI elrendezés)
+        private string _optStatus = "";
+        private string _spawnerStatus = "";
+        private string _formationStatus = "";
+        private float _lowFpsSince = -1f;
+        private int _discoSlice = 0;
+        private const float OptMinFps = 25f;        // ez alatt (3 mp-ig) a Káosz Özön leáll
+        private const string PrefOpt = "DuckGodMenu_Opt";
+        private const string PrefCam = "DuckGodMenu_Cam";
+
+        // Better Camera Mode: simított követés + körbeforgatás (középső egérgomb) + zoom (görgő)
+        private float _orbitYaw = 0f;
+        private float _orbitPitch = 30f;
+        private float _orbitDist = 5f;
+        private Vector3 _camVel = Vector3.zero;
+        private Vector3 _lastOrbitMouse;
+
+        private void LoadModeSettings()
+        {
+            try
+            {
+                _optimizationMode = PlayerPrefs.GetInt(PrefOpt, 0) == 1;
+                _betterCameraMode = PlayerPrefs.GetInt(PrefCam, 0) == 1;
+            }
+            catch { }
+        }
+
+        private void SaveModeSettings()
+        {
+            try
+            {
+                PlayerPrefs.SetInt(PrefOpt, _optimizationMode ? 1 : 0);
+                PlayerPrefs.SetInt(PrefCam, _betterCameraMode ? 1 : 0);
+                PlayerPrefs.Save();
+            }
+            catch { }
+        }
+
+        // Optimization Mode: FPS-védelem (a Disco-gyorsítás az ApplyDiscoColor-ban van)
+        private void UpdateOptimization()
+        {
+            if (_optimizationMode && _chaosModeActive && _fps > 0f && _fps < OptMinFps)
+            {
+                if (_lowFpsSince < 0f) _lowFpsSince = Time.unscaledTime;
+                else if (Time.unscaledTime - _lowFpsSince > 3f)
+                {
+                    _chaosModeActive = false;
+                    _lowFpsSince = -1f;
+                    _optStatus = T($"FPS dropped below {OptMinFps:F0}: Chaos Flood stopped.", $"Az FPS {OptMinFps:F0} alá esett: a Káosz Özön leállt.");
+                    LoggerInstance.Msg($"[OPT] FPS-védelem: a Káosz Özön leállt ({_fps:F0} FPS, {_cachedDucks.Count} kacsa).");
+                }
+            }
+            else _lowFpsSince = -1f;
+        }
+
+        // ---- Better Camera Mode: simított követés ----
+        private void FollowSmooth(Transform target)
+        {
+            float dt = Mathf.Max(0.0001f, Time.unscaledDeltaTime);
+            try
+            {
+                Vector3 mp = Input.mousePosition;
+                if (!MouseOverMenu())
+                {
+                    if (Input.GetMouseButtonDown(2)) _lastOrbitMouse = mp;
+                    if (Input.GetMouseButton(2))
+                    {
+                        _orbitYaw += (mp.x - _lastOrbitMouse.x) * 0.25f;
+                        _orbitPitch = Mathf.Clamp(_orbitPitch - (mp.y - _lastOrbitMouse.y) * 0.25f, -10f, 80f);
+                        _lastOrbitMouse = mp;
+                    }
+                    float scroll = Input.mouseScrollDelta.y;
+                    if (scroll != 0f) _orbitDist = Mathf.Clamp(_orbitDist - scroll * 0.6f, 1.5f, 30f);
+                }
+            }
+            catch (System.Exception ex) { LogErrorOnce($"[CAMERA] Orbit bemenet hiba: {ex.Message}"); }
+
+            if (_autoOrbit) _orbitYaw += 15f * dt; // lassú automatikus körbeforgás (Home)
+            Transform cam = _cachedMainCamera.transform;
+            Vector3 focus = target.position + new Vector3(0f, 0.3f, 0f);
+            Vector3 desired = focus + Quaternion.Euler(_orbitPitch, _orbitYaw, 0f) * new Vector3(0f, 0f, -_orbitDist);
+            cam.position = Vector3.SmoothDamp(cam.position, desired, ref _camVel, 0.15f, Mathf.Infinity, dt);
+            Vector3 dir = focus - cam.position;
+            if (dir.sqrMagnitude > 0.0001f)
+                cam.rotation = Quaternion.Slerp(cam.rotation, Quaternion.LookRotation(dir), 1f - Mathf.Exp(-12f * dt));
+        }
+
+        // ---- Collection Spawner: a Collection menüben rákattintott kacsa lespawnolása ----
+        private void TrySpawnFromCollection()
+        {
+            try
+            {
+                var uis = Object.FindObjectsOfType<DuckUI>();
+                if (uis == null) return;
+                Vector3 mp = Input.mousePosition;
+                DuckUI hit = null;
+                foreach (var ui in uis)
+                {
+                    if (ui == null || !ui.gameObject.activeInHierarchy) continue;
+                    var rt = ui.GetComponent<RectTransform>();
+                    if (rt == null) continue;
+                    bool inside = RectTransformUtility.RectangleContainsScreenPoint(rt, mp, null)
+                                  || (_cachedMainCamera != null && RectTransformUtility.RectangleContainsScreenPoint(rt, mp, _cachedMainCamera));
+                    if (inside) hit = ui;
+                }
+                if (hit == null) return; // nem kacsa-ikonra kattintott
+
+                string id = (GetMemberValue(hit, typeof(DuckUI), "ID") ?? GetMemberValue(hit, typeof(DuckUI), "duckID"))?.ToString();
+                if (string.IsNullOrEmpty(id)) { _spawnerStatus = T("Duck ID not readable (see the log).", "A kacsa azonosítója nem olvasható (lásd a naplót)."); LogErrorOnce("[SPAWNER] A DuckUI ID/duckID nem olvasható."); return; }
+
+                GeneralManager gm = GeneralManager.I;
+                if (gm == null) { _spawnerStatus = T("GeneralManager not available.", "A GeneralManager nem elérhető."); return; }
+                gm.DebugSpawnDuck(id);
+                _nextCacheUpdateTime = 0f;
+                _spawnerStatus = T("Spawned: ", "Lespawnolva: ") + id;
+                LoggerInstance.Msg($"[SPAWNER] Collection kacsa lespawnolva: {id}");
+            }
+            catch (System.Exception ex)
+            {
+                _spawnerStatus = T("Spawn failed: ", "Spawn sikertelen: ") + ex.Message;
+                LogErrorOnce($"[SPAWNER] Hiba: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        // ---- Formációk ----
+        private static Vector3 Flat(Vector3 v, Vector3 fallback)
+        {
+            v.y = 0f;
+            return v.sqrMagnitude < 0.0001f ? fallback : v.normalized;
+        }
+
+        private void ArrangeDucks(string kind)
+        {
+            try
+            {
+                var idx = new List<int>();
+                for (int i = 0; i < _cachedDucks.Count; i++)
+                    if (_cachedDucks[i].gameObject != null && _cachedDucks[i].transform != null) idx.Add(i);
+                int n = idx.Count;
+                if (n == 0) { _formationStatus = T("No ducks found.", "Nincs kacsa."); return; }
+
+                Vector3 center = PoolCenter + new Vector3(0f, 1f, 0f);
+                Vector3 right = Vector3.right, fwd = Vector3.forward;
+                if (_cachedMainCamera == null) UpdateCameraCache();
+                if (_cachedMainCamera != null)
+                {
+                    Transform ct = _cachedMainCamera.transform;
+                    Ray ray = new Ray(ct.position, ct.forward);
+                    if (Physics.Raycast(ray, out RaycastHit hit, 200f)) center = hit.point + new Vector3(0f, 1f, 0f);
+                    else center = ct.position + ct.forward * 12f;
+                    right = Flat(ct.right, Vector3.right);
+                    fwd = Flat(ct.forward, Vector3.forward);
+                }
+
+                float circleR = Mathf.Max(2f, n * 1.2f / (2f * Mathf.PI));
+                for (int k = 0; k < n; k++)
+                {
+                    Vector3 off;
+                    switch (kind)
+                    {
+                        case "circle":
+                        {
+                            float a = k * 2f * Mathf.PI / n;
+                            off = right * (Mathf.Cos(a) * circleR) + fwd * (Mathf.Sin(a) * circleR);
+                            break;
+                        }
+                        case "line":
+                            off = right * ((k - (n - 1) / 2f) * 1.3f);
+                            break;
+                        case "spiral":
+                        {
+                            float a = k * 0.55f;
+                            float r = 1.2f + 0.22f * k;
+                            off = right * (Mathf.Cos(a) * r) + fwd * (Mathf.Sin(a) * r);
+                            break;
+                        }
+                        default: // tower
+                            off = new Vector3(0f, k * 0.8f, 0f);
+                            break;
+                    }
+
+                    int i = idx[k];
+                    DuckData d = _cachedDucks[i];
+                    Vector3 pos = center + off;
+                    d.transform.position = pos;
+                    if (d.rigidbody != null && !d.rigidbody.isKinematic)
+                    {
+                        d.rigidbody.velocity = Vector3.zero;
+                        d.rigidbody.angularVelocity = Vector3.zero;
+                    }
+                    d.firstPos = pos; // különben az Eltűnt Kacsák Visszahozása visszadobná
+                    _cachedDucks[i] = d;
+                    _duckById[d.id] = d;
+                }
+                _formationStatus = T("Formation: ", "Formáció: ") + kind + $" ({n})";
+                LoggerInstance.Msg($"[FORMATION] {kind}: {n} kacsa elrendezve.");
+            }
+            catch (System.Exception ex)
+            {
+                _formationStatus = T("Formation failed: ", "Formáció sikertelen: ") + ex.Message;
+                LogErrorOnce($"[FORMATION] Hiba: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        // ---- Multiplayer: más játékosok kacsái védettek, a játékoslista a kacsák tulajdonosaiból épül ----
+        private readonly Dictionary<string, int> _playerDuckCounts = new Dictionary<string, int>();
+        private bool _ownerReadLogged = false;
+
+        // A kacsák tulajdonosának megállapítása. 1) a játék saját GetPlayerIdByDuck-ja (a játék játékos-kacsa térképe),
+        // 2) tartalékként a Fusion InputAuthority. Eredmény: _ownerOther = más játékosok kacsái, _playerDuckCounts = a lista.
+        private readonly HashSet<int> _ownerOther = new HashSet<int>();
+        private string _lastOwnerSummary = "";
+
+        private void PrepareOwnerInfo(IEnumerable<DuckManager> rawDucks)
+        {
+            _ownerOther.Clear();
+            _playerDuckCounts.Clear();
+            if (rawDucks == null) return;
+
+            GeneralManager gm = null;
+            int localId = int.MinValue;
+            try
+            {
+                gm = GeneralManager.I;
+                object lp = gm != null ? GetMemberValue(gm, typeof(GeneralManager), "LocalPlayer") : null;
+                object lid = lp != null ? GetMemberValue(lp, lp.GetType(), "ID") : null;
+                if (lid != null) localId = System.Convert.ToInt32(lid);
+            }
+            catch { }
+
+            var ids = new Dictionary<int, int>();
+            int total = 0, withId = 0;
+            foreach (var raw in rawDucks)
+            {
+                if (raw == null) continue;
+                total++;
+                int pid = -1;
+                try { if (gm != null) pid = gm.GetPlayerIdByDuck(raw); } catch { pid = -1; }
+                ids[raw.GetInstanceID()] = pid;
+                if (pid >= 0) withId++;
+            }
+            // A naplók alapján a játék a nem-játékos (világ) kacsákra negatív azonosítót ad, így az azonosító önmagában megbízható
+            bool idTrusted = gm != null;
+
+            int other = 0, mine = 0;
+            foreach (var raw in rawDucks)
+            {
+                if (raw == null) continue;
+                int inst = raw.GetInstanceID();
+                string label;
+                bool isOther;
+                if (idTrusted && ids[inst] >= 0)
+                {
+                    if (ids[inst] == localId) { label = T("you", "te"); isOther = false; }
+                    else { label = T("player ", "játékos ") + ids[inst]; isOther = true; }
+                }
+                else isOther = IsOtherPlayersDuck(raw, out label);
+
+                _playerDuckCounts[label] = (_playerDuckCounts.TryGetValue(label, out int oc) ? oc : 0) + 1;
+                if (isOther) { _ownerOther.Add(inst); other++; } else mine++;
+            }
+
+            string summary = $"id-módszer megbízható={idTrusted}, helyi játékos ID={localId}, kacsák={total}, azonosítóval={withId}, védett (más játékosé)={other}, kezelhető={mine}";
+            if (summary != _lastOwnerSummary)
+            {
+                _lastOwnerSummary = summary;
+                LoggerInstance.Msg("[NET] Tulajdonos-ellenőrzés: " + summary);
+            }
+        }
+
+        // true, ha a kacsa egy MÁSIK játékosé (input authority-ja érvényes és nem a helyi játékos)
+        private bool IsOtherPlayersDuck(DuckManager duck, out string label)
+        {
+            label = T("world / host", "világ / host");
+            try
+            {
+                object no = GetMemberValue(duck, typeof(DuckManager), "Object");
+                if (no == null)
+                {
+                    if (!_ownerReadLogged) { _ownerReadLogged = true; LoggerInstance.Msg("[NET] A kacsa NetworkObject-je nem olvasható: a tulajdonos nem állapítható meg (a kacsa nem védett)."); }
+                    return false;
+                }
+                var nt = no.GetType();
+                object hasInput = GetMemberValue(no, nt, "HasInputAuthority");
+                if (hasInput is bool hb && hb) { label = T("you", "te"); return false; }
+
+                object ia = GetMemberValue(no, nt, "InputAuthority");
+                if (ia == null) return false;
+                object isNone = GetMemberValue(ia, ia.GetType(), "IsNone");
+                if (isNone is bool nb && !nb)
+                {
+                    label = T("player ", "játékos ") + ia;
+                    return true;
+                }
+                return false;
+            }
+            catch (System.Exception ex)
+            {
+                if (!_ownerReadLogged) { _ownerReadLogged = true; LoggerInstance.Msg("[NET] Tulajdonos-ellenőrzés hiba: " + ex.Message); }
+                return false;
+            }
         }
 
         // ---- Multiplayer védelem ----
@@ -484,13 +1004,24 @@ namespace DuckGodMenu
                 {
                     _langLoaded = true;
                     try { _hu = PlayerPrefs.GetInt(LangPrefKey, 0) == 1; } catch { _hu = false; }
+                    LoadModeSettings();
+                    LoadMenuKey();
                 }
 
-                if (Input.GetKeyDown(KeyCode.F9))
+                if (!_rebindingMenuKey && Input.GetKeyDown(_menuKey))
                 {
                     _showMenu = !_showMenu;
+                    _screenshotMode = false;
                     if (_showMenu) UpdateCameraCache();
                 }
+
+                _mpUi = _isMultiplayer;
+                if (_isMultiplayer && !Mathf.Approximately(_gameSpeed, 1f)) { _gameSpeed = 1f; Time.timeScale = 1f; } // a játék sebessége mindenkit érint
+                if (_betterCameraMode && Input.GetKeyDown(KeyCode.F8)) _screenshotMode = !_screenshotMode; // képernyőkép mód: menü és ESP eltűnik
+                if (_collectionSpawner && Input.GetMouseButtonDown(0) && !MouseOverMenu()) TrySpawnFromCollection();
+                UpdateOptimization();
+                UpdateCameraExtras();
+                if (_isMultiplayer && _protectedIds.Count > 0) { UnprotectAll(); _protectStatus = ""; } // a védelem csak egyjátékos módban él
 
                 // Szabad Kamera: a Space be/ki kapcsolja a repülést (csak ha a menüben be van kapcsolva a funkció)
                 if (_freeCamEnabled && Input.GetKeyDown(KeyCode.Space)) SetFlight(!_freeCamFlying);
@@ -507,7 +1038,7 @@ namespace DuckGodMenu
                 // A cache időzítése unscaledTime-mal megy, így a játék sebességétől vagy szünetelésétől független
                 if (Time.unscaledTime > _nextCacheUpdateTime)
                 {
-                    _nextCacheUpdateTime = Time.unscaledTime + CacheInterval;
+                    _nextCacheUpdateTime = Time.unscaledTime + CurrentCacheInterval();
                     if (_cachedMainCamera == null) UpdateCameraCache(); // jelenetváltás után is újra megkeresi
                     UpdateDuckCache();
                 }
@@ -528,7 +1059,7 @@ namespace DuckGodMenu
 
                 if (_discoMode && Time.time > _nextDiscoTime)
                 {
-                    _nextDiscoTime = Time.time + 0.1f;
+                    _nextDiscoTime = Time.time + (_optimizationMode ? 0.05f : 0.1f);
                     ApplyDiscoColor(Color.HSVToRGB(Random.value, 1f, 1f));
                 }
 
@@ -590,8 +1121,12 @@ namespace DuckGodMenu
 
                     if (targetDuck.gameObject != null)
                     {
-                        _cachedMainCamera.transform.position = targetDuck.transform.position + new Vector3(0, 2.5f, -4f);
-                        _cachedMainCamera.transform.LookAt(targetDuck.transform);
+                        if (_betterCameraMode) FollowSmooth(targetDuck.transform);
+                        else
+                        {
+                            _cachedMainCamera.transform.position = targetDuck.transform.position + new Vector3(0, 2.5f, -4f);
+                            _cachedMainCamera.transform.LookAt(targetDuck.transform);
+                        }
                     }
                 }
             }
@@ -832,11 +1367,16 @@ namespace DuckGodMenu
                 _colorId = Shader.PropertyToID("_Color");
             }
 
+            // Optimization Mode: körönként csak a kacsák negyede frissül, és csak a látható rendererek
+            int stride = _optimizationMode ? 4 : 1;
+            int slice = stride > 1 ? (_discoSlice++ % stride) : 0;
             for (int i = 0; i < _cachedDucks.Count; i++)
             {
+                if (stride > 1 && (i % stride) != slice) continue;
                 DuckData d = _cachedDucks[i];
                 Renderer r = d.renderer;
                 if (r == null) continue;
+                if (_optimizationMode && !r.isVisible) continue;
 
                 if (!_discoStates.TryGetValue(d.id, out DiscoState st))
                 {
@@ -947,6 +1487,7 @@ namespace DuckGodMenu
 
             var rawDucks = Object.FindObjectsOfType<DuckManager>();
             _seenIds.Clear();
+            if (_isMultiplayer) PrepareOwnerInfo(rawDucks); else { _ownerOther.Clear(); _playerDuckCounts.Clear(); }
 
             if (rawDucks != null)
             {
@@ -955,6 +1496,10 @@ namespace DuckGodMenu
                     if (rawDuck == null) continue;
                     try
                     {
+                        // Multiplayer: más játékosok kacsáit a mod nem látja és nem módosítja
+                        if (_isMultiplayer && _ownerOther.Contains(rawDuck.GetInstanceID())) continue; // nem kerül a _seenIds-be, így a cache-ből is kikerül
+                        if (_protectedIds.Count > 0 && _protectedIds.Contains(rawDuck.GetInstanceID())) continue; // védett kacsa
+
                         int id = rawDuck.GetInstanceID();
                         _seenIds.Add(id);
 
@@ -1060,6 +1605,7 @@ namespace DuckGodMenu
                 try
                 {
                     float sq = rawDuck.squareDistanceToDespawn;
+                    if (sq > 1f && sq < 1e11f) _rescueDespawnSq = sq;
                     LoggerInstance.Msg($"[RESCUE-DIAG] DuckManager.squareDistanceToDespawn = {sq} (kb. {Mathf.Sqrt(sq):F0} egység). A visszahozás határai: {RescueDepth} egység mélység, {RescueDistance} egység távolság.");
                 }
                 catch (System.Exception dex) { LogErrorOnce($"[RESCUE-DIAG] squareDistanceToDespawn nem olvasható: {dex.Message}"); }
@@ -1171,6 +1717,8 @@ namespace DuckGodMenu
         public override void OnGUI()
         {
             if (!IsHostOrSolo()) return;
+            CaptureMenuKey();
+            if (_screenshotMode) return;
             try
             {
                 if (!_diagOnGuiLogged)
@@ -1193,8 +1741,10 @@ namespace DuckGodMenu
                 {
                     string duckLabel = T("Duck", "Kacsa");
                     GUI.color = Color.yellow;
+                    int espDrawn = 0;
                     for (int i = 0; i < _cachedDucks.Count; i++)
                     {
+                        if (_optimizationMode && espDrawn >= 80) break; // Optimization Mode: legfeljebb 80 címke
                         var d = _cachedDucks[i];
                         if (d.gameObject == null) continue;
                         Vector3 screenPos = _cachedMainCamera.WorldToScreenPoint(d.transform.position);
@@ -1202,6 +1752,7 @@ namespace DuckGodMenu
                         {
                             float guiY = Screen.height - screenPos.y;
                             GUI.Label(new Rect(screenPos.x - 25, guiY - 20, 60, 20), duckLabel + $" [{i + 1}]");
+                            espDrawn++;
                         }
                     }
                     GUI.color = Color.white;
@@ -1385,12 +1936,19 @@ namespace DuckGodMenu
             // ---- ALAPBEÁLLÍTÁSOK ----
             SafeLabel(T("Basic Settings", "Alapbeállítások"), _headerStyle);
             SafeLabel(T("Game speed", "Játék sebessége") + $": {Time.timeScale:F1}x");
-            float newSpeed = SafeSlider(_gameSpeed, 0.1f, 10.0f);
-            if (!Mathf.Approximately(newSpeed, _gameSpeed))
+            if (_mpUi)
             {
-                // Csak akkor írjuk a timeScale-t, ha a felhasználó tényleg mozdította a csúszkát
-                _gameSpeed = newSpeed;
-                Time.timeScale = _gameSpeed;
+                SafeLabel(T("Game speed is locked in multiplayer (it would affect other players).", "A játék sebessége multiplayerben zárolva van (más játékosokat is érintene)."));
+            }
+            else
+            {
+                float newSpeed = SafeSlider(_gameSpeed, 0.1f, 10.0f);
+                if (!Mathf.Approximately(newSpeed, _gameSpeed))
+                {
+                    // Csak akkor írjuk a timeScale-t, ha a felhasználó tényleg mozdította a csúszkát
+                    _gameSpeed = newSpeed;
+                    Time.timeScale = _gameSpeed;
+                }
             }
             if (SafeButton(T("Rotate Sun", "Napszak Forgatása"), _customBtnStyle))
             {
@@ -1477,6 +2035,14 @@ namespace DuckGodMenu
             _clonePickerActive = SafeToggle(_clonePickerActive, T("Duck Picker (left click a duck to select it)", "Kacsaválasztó (bal klikk egy kacsára)"));
             SafeLabel(T("Selected duck", "Kiválasztott kacsa") + ": " + SelectedDuckLabel());
             if (SafeButton(T("Clone selected duck", "Kijelölt kacsa klónozása"), _customBtnStyle)) CloneSelectedDuck();
+            if (_mpUi) SafeLabel(T("Duck protection: singleplayer only.", "Kacsa-védelem: csak egyjátékos módban."));
+            else
+            {
+                bool selProtected = _selectedDuck != null && _protectedIds.Contains(_selectedDuckId);
+                if (SafeButton(selProtected ? T("Remove protection from selected duck", "Kijelölt kacsa védelmének levétele") : T("Protect selected duck (from the mod and despawn)", "Kijelölt kacsa védelme (a modtól és a despawntól)"), _customBtnStyle)) ToggleProtectSelected();
+                if (SafeButton(T("Remove all protection", "Minden védelem levétele") + $" [{_protectedIds.Count}]", _customBtnStyle)) { UnprotectAll(); _protectStatus = T("All protection removed.", "Minden védelem levéve."); }
+                SafeLabel(string.IsNullOrEmpty(_protectStatus) ? " " : _protectStatus);
+            }
             _gravityGunActive = SafeToggle(_gravityGunActive, T("Gravity Gun (right click: nearest duck jumps to the mouse)", "Gravitációs Fegyver (jobb klikk: a legközelebbi kacsa az egérhez ugrik)"));
 
             // ---- 4. ESZKÖZÖK ----
@@ -1529,9 +2095,52 @@ namespace DuckGodMenu
                 SafeLabel(string.IsNullOrEmpty(_weatherStatus) ? " " : _weatherStatus);
             }
 
+            // ---- 6. SPAWNER ÉS FORMÁCIÓK ----
+            if (Section(6, T("6. Spawner & Formations", "6. Spawner és Formációk")))
+            {
+                _collectionSpawner = SafeToggle(_collectionSpawner, T("Collection Spawner (click a duck in the Collection menu)", "Collection Spawner (kattints egy kacsára a Collection menüben)"));
+                SafeLabel(string.IsNullOrEmpty(_spawnerStatus) ? " " : _spawnerStatus);
+                if (SafeButton(T("Formation: Circle", "Formáció: Kör"), _customBtnStyle)) ArrangeDucks("circle");
+                if (SafeButton(T("Formation: Line", "Formáció: Sor"), _customBtnStyle)) ArrangeDucks("line");
+                if (SafeButton(T("Formation: Spiral", "Formáció: Spirál"), _customBtnStyle)) ArrangeDucks("spiral");
+                if (SafeButton(T("Formation: Tower", "Formáció: Torony"), _customBtnStyle)) ArrangeDucks("tower");
+                SafeLabel(string.IsNullOrEmpty(_formationStatus) ? " " : _formationStatus);
+                if (SafeButton(T("Respawn All Ducks (to the spawn point)", "Respawn All Ducks (a spawn-pontra)"), _customBtnStyle)) RespawnAllDucks();
+                SafeLabel(string.IsNullOrEmpty(_respawnStatus) ? " " : _respawnStatus);
+            }
+
+            // ---- 7. MULTIPLAYER ----
+            if (_mpUi && Section(7, T("7. Multiplayer", "7. Multiplayer")))
+            {
+                SafeLabel(T("Other players' ducks are protected: the mod does not see or change them.", "Más játékosok kacsái védettek: a mod nem látja és nem módosítja őket."));
+                SafeLabel(T("Ducks per owner:", "Kacsák tulajdonosonként:"), _headerStyle);
+                foreach (var kv in _playerDuckCounts) SafeLabel($"{kv.Key}: <color=yellow>{kv.Value}</color>");
+            }
+
             // ---- UTASÍTÁSOK ÉS RENDSZER ----
             SafeSpace(10);
             SafeLabel(T("System Commands", "Rendszer Parancsok"), _headerStyle);
+
+            if (SafeButton(_rebindingMenuKey ? T("Press a key... (Esc = cancel)", "Nyomj meg egy billentyűt... (Esc = mégse)") : T("Menu key: ", "Menü-billentyű: ") + _menuKey + T("  (click to change)", "  (kattints a módosításhoz)"), _customBtnStyle))
+                _rebindingMenuKey = !_rebindingMenuKey;
+
+            bool newOpt = SafeToggle(_optimizationMode, T("Optimization Mode", "Optimization Mode"), _customBtnStyle);
+            if (newOpt != _optimizationMode)
+            {
+                _optimizationMode = newOpt;
+                if (!newOpt) _optStatus = "";
+                SaveModeSettings();
+            }
+            if (_optimizationMode) SafeLabel(string.IsNullOrEmpty(_optStatus) ? T("Faster Disco, rarer duck scan, max 80 ESP labels, Chaos Flood stops below 25 FPS.", "Gyorsabb Disco, ritkább kacsa-keresés, max 80 ESP címke, a Káosz Özön 25 FPS alatt leáll.") : _optStatus);
+
+            bool newCamMode = SafeToggle(_betterCameraMode, T("Better Camera Mode", "Better Camera Mode"), _customBtnStyle);
+            if (newCamMode != _betterCameraMode)
+            {
+                _betterCameraMode = newCamMode;
+                if (!newCamMode) _screenshotMode = false;
+                SaveModeSettings();
+            }
+            if (_betterCameraMode) SafeLabel(T("Smooth follow, MMB drag = orbit, wheel = zoom, PgUp/PgDn = prev/next duck, Home = auto-orbit, End = cinematic, F8 = screenshot mode.", "Simított követés, középső gomb húzás = körbeforgatás, görgő = zoom, PgUp/PgDn = előző/következő kacsa, Home = auto-körbeforgás, End = filmes mód, F8 = képernyőkép mód."));
 
 
             _chaosModeActive = SafeToggle(_chaosModeActive, T("Chaos Flood", "Káosz Özön"), _customBtnStyle);
@@ -1969,18 +2578,56 @@ namespace DuckGodMenu
 
         private void RescueLostDucks()
         {
-            for (int i = 0; i < _cachedDucks.Count; i++)
+            int n = _cachedDucks.Count;
+            if (n == 0) return;
+
+            if (_rescueDespawnSq <= 0f) _rescueDespawnSq = 1000f * 1000f; // az első kacsánál kiolvasott érték felülírja (RESCUE-DIAG)
+            float farSq = _rescueDespawnSq * 0.64f; // a játék despawn-távolságának 80%-a: még a despawn ELŐTT visszahozzuk
+
+            var lostIdx = new List<int>();
+            for (int i = 0; i < n; i++)
             {
                 DuckData d = _cachedDucks[i];
                 if (d.gameObject == null || d.transform == null) continue;
                 if (IsInvalid(d.firstPos)) continue; // nincs hova visszatenni
 
                 Vector3 p = d.transform.position;
-                bool lost = IsInvalid(p)
-                    || p.y < d.firstPos.y - RescueDepth
-                    || (p - d.firstPos).sqrMagnitude > RescueDistance * RescueDistance;
-                if (!lost) continue;
+                bool lost;
+                if (IsInvalid(p)) lost = true;
+                else
+                {
+                    // 1) a játék despawn-távolsága közelében (a tó nagy: a sima sodródás nem számít)
+                    bool tooFar = (p - PoolCenter).sqrMagnitude > farSq;
+                    // 2) mélyen a víz alatt / a világ alatt (a levegőben spawnolt kacsa lezuhanása a vízre nem számít)
+                    float floorY = Mathf.Min(d.firstPos.y, LakeLevelGuess) - RescueDepth;
+                    bool tooDeep = p.y < floorY;
+                    lost = tooFar || tooDeep;
+                }
+                if (lost) lostIdx.Add(i);
+            }
+            if (lostIdx.Count == 0) return;
 
+            // Védelem: ha a kacsák nagy része egyszerre "elveszett", a szabály nem illik a pályához - inkább nem nyúlunk hozzájuk
+            if (n >= 5 && lostIdx.Count > n * RescueMassFraction)
+            {
+                if (!_rescueMassLogged)
+                {
+                    _rescueMassLogged = true;
+                    LoggerInstance.Msg($"[RESCUE] {lostIdx.Count}/{n} kacsa egyszerre elveszettnek látszik - a visszahozás kihagyva (a szabály valószínűleg nem illik ehhez a pályához).");
+                }
+                return;
+            }
+            _rescueMassLogged = false;
+
+            foreach (int i in lostIdx)
+            {
+                DuckData d = _cachedDucks[i];
+                Vector3 p = d.transform.position;
+
+                if (_lastRescueTime.TryGetValue(d.id, out float last) && Time.unscaledTime - last < RescueCooldown) continue;
+                if (!IsInvalid(p) && d.manager != null && IsInOtherZone(d)) continue;
+
+                _lastRescueTime[d.id] = Time.unscaledTime;
                 d.transform.position = d.firstPos;
                 if (d.rigidbody != null && !d.rigidbody.isKinematic)
                 {
@@ -2549,10 +3196,18 @@ namespace DuckGodMenu
             new[] { "Magnet (Mouse)", "Mágnes (Egér)", "Ducks are pulled toward the point under the cursor.", "A kacsák a kurzor alatti pont felé húzódnak." },
             new[] { "Camera Follow", "Kamera Követés", "The camera follows a duck. Next Duck switches the target. Turning it off restores the camera.", "A kamera egy kacsát követ. A Következő Kacsa váltja a célpontot. Kikapcsoláskor visszaáll a kamera." },
             new[] { "Free Camera", "Szabad Kamera", "Enable it, then Space starts and stops flying. WASD moves, Q/E down/up, Shift is fast, hold right mouse to look. Exiting restores the camera.", "Kapcsold be, utána a Space indítja és állítja le a repülést. WASD mozgás, Q/E le/fel, Shift gyors, jobb egérgomb nyomva = nézelődés. Kilépéskor visszaáll a kamera." },
-            new[] { "Rescue Lost Ducks", "Eltűnt Kacsák Visszahozása", "Ducks that fall 60 units below, get 300 units away or get an invalid position are put back to their first position.", "A 60 egységet lezuhant, 300 egységnél messzebb jutott vagy érvénytelen helyű kacsák visszakerülnek az első helyükre." },
+            new[] { "Rescue Lost Ducks", "Eltűnt Kacsák Visszahozása", "Ducks that fall far below the water, get close to the game's despawn distance or get an invalid position are put back to their first position (once per 10 s per duck). Ducks in other zones are left alone, and nothing is moved if many ducks look lost at once.", "A vízszint alá mélyen lezuhant, a játék despawn-távolsága közelébe jutott vagy érvénytelen helyű kacsák visszakerülnek az első helyükre (kacsánként 10 mp-enként egyszer). A más területeken lévő kacsákhoz nem nyúl, és ha egyszerre sok kacsa tűnik elveszettnek, semmit sem mozgat." },
             new[] { "Weather buttons", "Időjárás gombok", "Clear sky, Rain, Snow and Fog change the weather through the game's Enviro system. Fog uses the closest weather type this game has (Cloudy 3). Without Enviro, only Fog and Clear sky work (basic fog).", "A Tiszta ég, Eső, Hó és Köd a játék Enviro rendszerén át váltja az időjárást. Enviro nélkül csak a Köd és a Tiszta ég működik (egyszerű köd)." },
             new[] { "Clear ALL weather", "Minden időjárás törlése", "Instantly switches to Clear sky and restores the original fog (undoes Fog/Rain/Snow).", "Azonnal tiszta égre vált, és visszaállítja az eredeti ködöt (visszavonja a Köd/Eső/Hó hatását)." },
             new[] { "Chaos Flood", "Káosz Özön", "Spawns a duck every 0.15 s until 50 ducks exist, then switches itself off.", "0,15 másodpercenként spawnol egy kacsát, amíg 50 kacsa nincs, utána magától kikapcsol." },
+            new[] { "Collection Spawner", "Collection Spawner", "With it on, clicking a duck in the game's Collection menu spawns that duck.", "Bekapcsolva a játék Collection menüjében egy kacsára kattintva az a kacsa lespawnol." },
+            new[] { "Formations", "Formációk", "Circle, Line, Spiral and Tower arrange all your ducks around the point the camera is looking at.", "A Kör, Sor, Spirál és Torony a kameráddal nézett pont köré rendezi az összes kacsádat." },
+            new[] { "Optimization Mode", "Optimization Mode", "Disco updates only a quarter of the visible ducks per tick, the full duck scan runs less often with many ducks, ESP shows at most 80 labels, and Chaos Flood stops when FPS stays under 25 for 3 seconds. The setting is saved.", "A Disco tickenként csak a látható kacsák negyedét frissíti, sok kacsánál a teljes kacsa-keresés ritkábban fut, az ESP legfeljebb 80 címkét mutat, és a Káosz Özön leáll, ha az FPS 3 másodpercig 25 alatt van. A beállítás mentődik." },
+            new[] { "Better Camera Mode", "Better Camera Mode", "Camera Follow becomes smooth. Hold the middle mouse button and drag to orbit, use the wheel to zoom. PgUp/PgDn switch ducks, Home = auto-orbit, End = cinematic (random duck every 12 s). F8 hides the menu and ESP for screenshots (the menu key brings it back). The setting is saved.", "A Kamera Követés simává válik. Középső egérgomb nyomva + húzás = körbeforgatás, görgő = zoom. PgUp/PgDn = kacsaváltás, Home = auto-körbeforgás, End = filmes mód (12 mp-enként véletlen kacsa). Az F8 elrejti a menüt és az ESP-t képernyőképhez (a menü-billentyű visszahozza). A beállítás mentődik." },
+            new[] { "Multiplayer protection", "Multiplayer védelem", "While hosting, other players' ducks are not touched by the mod. The Multiplayer section lists how many ducks each owner has.", "Hostolás közben a mod nem nyúl más játékosok kacsáihoz. A Multiplayer szekció megmutatja, kinek hány kacsája van." },
+            new[] { "Respawn All Ducks", "Respawn All Ducks", "Puts every duck you control onto the game's spawn point (with a small spread). Click twice to confirm.", "Minden általad kezelhető kacsát a játék spawn-pontjára tesz (kis szórással). A megerősítéshez kétszer kell kattintani." },
+            new[] { "Protect selected duck", "Kijelölt kacsa védelme", "Singleplayer only. A protected duck is invisible to every mod feature (its mod changes are removed) and the game's despawn distance for it is set huge. Use the Remove buttons to undo it.", "Csak egyjátékos módban. A védett kacsát a mod egyik funkciója sem látja (a modos módosítások lekerülnek róla), és a játék despawn-távolsága rá hatalmasra van állítva. A levétel gombokkal visszavonható." },
+            new[] { "Menu key", "Menü-billentyű", "Click the Menu key button, then press the key you want to open and close the menu with. Esc cancels. The key is saved.", "Kattints a Menü-billentyű gombra, majd nyomd meg a billentyűt, amivel a menüt nyitni és zárni szeretnéd. Az Esc mégse. A billentyű mentődik." },
             new[] { "[MOD] tag (multiplayer)", "[MOD] jelzés (multiplayer)", "When you host a multiplayer game, \"[MOD] \" is put in front of your duck's name so other players can see the server is modded. It cannot be turned off while hosting; the name is restored when you leave.", "Multiplayer hostolásnál a kacsád neve elé \"[MOD] \" kerül, hogy a többi játékos lássa, hogy a szerver moddal fut. Hostolás közben nem kapcsolható ki; kilépéskor a név visszaáll." },
             new[] { "Quick Spawn", "Gyors Spawn", "Spawns one random duck.", "Egy véletlen kacsát spawnol." },
             new[] { "DELETE ALL DUCKS", "MINDEN KACSA TÖRLÉSE", "Deletes every duck. It needs two clicks within 3 seconds.", "Törli az összes kacsát. 3 másodpercen belül két kattintás kell hozzá." },
