@@ -91,7 +91,7 @@ namespace DuckGodMenu
     public class Main : MelonMod
     {
         public const string ModVersion = "6.9.0";
-        private const string DebugVersion = "0.9.74";
+        private const string DebugVersion = "0.9.75";
 
         private struct DuckData
         {
@@ -321,6 +321,16 @@ namespace DuckGodMenu
             return _windowRect.Contains(p) || (_showGuide && _guideRect.Contains(p));
         }
 
+        // ================= v9: kamera-szkriptek kezelése + erősebb optimalizálás =================
+        private int _physPhase = 0;
+        // Optimization Mode szint: ennyiedével ritkítjuk a kacsánkénti fizikai munkát (az erőket ugyanennyiszeresre növelve)
+        private int OptStride()
+        {
+            if (!_optimizationMode) return 1;
+            int n = _cachedDucks.Count;
+            return n > 240 ? 4 : (n > 160 ? 3 : (n > 80 ? 2 : 1));
+        }
+
         // ================= v8: menü-billentyű, Rescue javítás, Respawn All, kacsa-védelem, Opt/Camera extrák =================
         private KeyCode _menuKey = KeyCode.F9;
         private bool _rebindingMenuKey = false;
@@ -510,32 +520,76 @@ namespace DuckGodMenu
         private float CurrentCacheInterval()
         {
             if (!_optimizationMode) return CacheInterval;
+            if (_chaosModeActive || _pendingSpawnTimes.Count > 0) return CacheInterval; // spawnolás közben pontos darabszám kell
             int n = _cachedDucks.Count;
             return n > 120 ? 5f : (n > 60 ? 3.5f : CacheInterval); // sok kacsánál ritkábban fut a (drága) teljes keresés
         }
 
-        // ---- Better Camera Mode extrák ----
-        private bool _autoOrbit = false;
-        private bool _cinematic = false;
-        private float _nextCinematicSwitch = 0f;
+        // ---- Képernyőkép mód billentyű (F8) ----
+        // Kétféle úton érkezik: Input.GetKeyDown (OnUpdate) és IMGUI KeyDown esemény (OnGUI), így ha az egyik nem működik a játékban,
+        // a másik átveszi. A 0,2 mp-es tiltás megakadályozza, hogy ugyanaz a lenyomás kétszer számítson (vagy az OS billentyű-ismétlése pörgesse).
+        private float _lastScreenshotKeyTime = -10f;
+
+        private void ScreenshotKey()
+        {
+            if (Time.unscaledTime - _lastScreenshotKeyTime < 0.2f) return;
+            _lastScreenshotKeyTime = Time.unscaledTime;
+            SetScreenshotMode(!_screenshotMode);
+        }
+
+        private void HandleCamKeyEvent()
+        {
+            Event e = Event.current;
+            if (e == null || e.type != EventType.KeyDown || _rebindingMenuKey) return;
+            if (e.keyCode == KeyCode.F8) ScreenshotKey();
+        }
 
         private void UpdateCameraExtras()
         {
-            if (!_betterCameraMode || !_cameraFollowActive || _cachedDucks.Count == 0) return;
-            if (Input.GetKeyDown(KeyCode.PageDown)) _cameraTargetIndex++;
-            if (Input.GetKeyDown(KeyCode.PageUp)) _cameraTargetIndex = _cameraTargetIndex > 0 ? _cameraTargetIndex - 1 : _cachedDucks.Count - 1;
-            if (Input.GetKeyDown(KeyCode.Home)) _autoOrbit = !_autoOrbit;
-            if (Input.GetKeyDown(KeyCode.End)) { _cinematic = !_cinematic; _nextCinematicSwitch = Time.unscaledTime + 12f; }
-            if (_cinematic && Time.unscaledTime > _nextCinematicSwitch)
-            {
-                _nextCinematicSwitch = Time.unscaledTime + 12f;
-                _cameraTargetIndex = Random.Range(0, _cachedDucks.Count);
-            }
+            if (!_rebindingMenuKey && Input.GetKeyDown(KeyCode.F8)) ScreenshotKey();
         }
 
-        // ================= v7: Optimization Mode, Better Camera Mode, Spawner, Formációk, Multiplayer védelem =================
+        // Képernyőkép mód: a mod menüje és ESP-je mellett a játék saját felületét (minden Canvas) is elrejti, kilépéskor visszaállítja
+        private readonly List<Canvas> _hiddenCanvases = new List<Canvas>();
+
+        private void SetScreenshotMode(bool on)
+        {
+            if (on == _screenshotMode) return;
+            _screenshotMode = on;
+            try
+            {
+                if (on)
+                {
+                    _hiddenCanvases.Clear();
+                    var cs = Object.FindObjectsOfType<Canvas>();
+                    if (cs != null)
+                    {
+                        foreach (var c in cs)
+                        {
+                            if (c == null || !c.enabled) continue;
+                            c.enabled = false;
+                            _hiddenCanvases.Add(c);
+                        }
+                    }
+                    LoggerInstance.Msg($"[SCREENSHOT] Képernyőkép mód be: {_hiddenCanvases.Count} játék-Canvas elrejtve. Kilépés: F8 vagy a menü-billentyű.");
+                }
+                else RestoreHiddenCanvases();
+            }
+            catch (System.Exception ex) { LogErrorOnce($"[SCREENSHOT] Hiba: {ex.GetType().Name}: {ex.Message}"); }
+        }
+
+        private void RestoreHiddenCanvases()
+        {
+            for (int i = 0; i < _hiddenCanvases.Count; i++)
+            {
+                try { if (_hiddenCanvases[i] != null) _hiddenCanvases[i].enabled = true; }
+                catch (System.Exception ex) { LogErrorOnce($"[SCREENSHOT] Canvas visszakapcsolása sikertelen: {ex.Message}"); }
+            }
+            _hiddenCanvases.Clear();
+        }
+
+        // ================= v7: Optimization Mode, Spawner, Formációk, Multiplayer védelem =================
         private bool _optimizationMode = false;
-        private bool _betterCameraMode = false;
         private bool _collectionSpawner = false;
         private bool _screenshotMode = false;
         private bool _mpUi = false;                 // az _isMultiplayer másolata, csak OnUpdate-ben frissül (stabil IMGUI elrendezés)
@@ -546,21 +600,12 @@ namespace DuckGodMenu
         private int _discoSlice = 0;
         private const float OptMinFps = 25f;        // ez alatt (3 mp-ig) a Káosz Özön leáll
         private const string PrefOpt = "DuckGodMenu_Opt";
-        private const string PrefCam = "DuckGodMenu_Cam";
-
-        // Better Camera Mode: simított követés + körbeforgatás (középső egérgomb) + zoom (görgő)
-        private float _orbitYaw = 0f;
-        private float _orbitPitch = 30f;
-        private float _orbitDist = 5f;
-        private Vector3 _camVel = Vector3.zero;
-        private Vector3 _lastOrbitMouse;
 
         private void LoadModeSettings()
         {
             try
             {
                 _optimizationMode = PlayerPrefs.GetInt(PrefOpt, 0) == 1;
-                _betterCameraMode = PlayerPrefs.GetInt(PrefCam, 0) == 1;
             }
             catch { }
         }
@@ -570,7 +615,6 @@ namespace DuckGodMenu
             try
             {
                 PlayerPrefs.SetInt(PrefOpt, _optimizationMode ? 1 : 0);
-                PlayerPrefs.SetInt(PrefCam, _betterCameraMode ? 1 : 0);
                 PlayerPrefs.Save();
             }
             catch { }
@@ -591,38 +635,6 @@ namespace DuckGodMenu
                 }
             }
             else _lowFpsSince = -1f;
-        }
-
-        // ---- Better Camera Mode: simított követés ----
-        private void FollowSmooth(Transform target)
-        {
-            float dt = Mathf.Max(0.0001f, Time.unscaledDeltaTime);
-            try
-            {
-                Vector3 mp = Input.mousePosition;
-                if (!MouseOverMenu())
-                {
-                    if (Input.GetMouseButtonDown(2)) _lastOrbitMouse = mp;
-                    if (Input.GetMouseButton(2))
-                    {
-                        _orbitYaw += (mp.x - _lastOrbitMouse.x) * 0.25f;
-                        _orbitPitch = Mathf.Clamp(_orbitPitch - (mp.y - _lastOrbitMouse.y) * 0.25f, -10f, 80f);
-                        _lastOrbitMouse = mp;
-                    }
-                    float scroll = Input.mouseScrollDelta.y;
-                    if (scroll != 0f) _orbitDist = Mathf.Clamp(_orbitDist - scroll * 0.6f, 1.5f, 30f);
-                }
-            }
-            catch (System.Exception ex) { LogErrorOnce($"[CAMERA] Orbit bemenet hiba: {ex.Message}"); }
-
-            if (_autoOrbit) _orbitYaw += 15f * dt; // lassú automatikus körbeforgás (Home)
-            Transform cam = _cachedMainCamera.transform;
-            Vector3 focus = target.position + new Vector3(0f, 0.3f, 0f);
-            Vector3 desired = focus + Quaternion.Euler(_orbitPitch, _orbitYaw, 0f) * new Vector3(0f, 0f, -_orbitDist);
-            cam.position = Vector3.SmoothDamp(cam.position, desired, ref _camVel, 0.15f, Mathf.Infinity, dt);
-            Vector3 dir = focus - cam.position;
-            if (dir.sqrMagnitude > 0.0001f)
-                cam.rotation = Quaternion.Slerp(cam.rotation, Quaternion.LookRotation(dir), 1f - Mathf.Exp(-12f * dt));
         }
 
         // ---- Collection Spawner: a Collection menüben rákattintott kacsa lespawnolása ----
@@ -991,6 +1003,7 @@ namespace DuckGodMenu
         public override void OnApplicationQuit()
         {
             RestoreModNotice();
+            RestoreHiddenCanvases();
         }
 
         public override void OnUpdate()
@@ -1010,14 +1023,13 @@ namespace DuckGodMenu
 
                 if (!_rebindingMenuKey && Input.GetKeyDown(_menuKey))
                 {
-                    _showMenu = !_showMenu;
-                    _screenshotMode = false;
+                    if (_screenshotMode) { SetScreenshotMode(false); _showMenu = true; } // kilépés a képernyőkép módból: a menü visszajön
+                    else _showMenu = !_showMenu;
                     if (_showMenu) UpdateCameraCache();
                 }
 
                 _mpUi = _isMultiplayer;
                 if (_isMultiplayer && !Mathf.Approximately(_gameSpeed, 1f)) { _gameSpeed = 1f; Time.timeScale = 1f; } // a játék sebessége mindenkit érint
-                if (_betterCameraMode && Input.GetKeyDown(KeyCode.F8)) _screenshotMode = !_screenshotMode; // képernyőkép mód: menü és ESP eltűnik
                 if (_collectionSpawner && Input.GetMouseButtonDown(0) && !MouseOverMenu()) TrySpawnFromCollection();
                 UpdateOptimization();
                 UpdateCameraExtras();
@@ -1073,8 +1085,9 @@ namespace DuckGodMenu
                 {
                     if (MouseOverMenu()) return;
 
+                    var knownBefore = new HashSet<int>(_duckById.Keys);
                     if (TrySpawnRandomDuck())
-                        MelonCoroutines.Start(FireLastDuckCoroutine());
+                        MelonCoroutines.Start(FireNewDuckCoroutine(knownBefore));
                 }
             }
             catch (System.Exception ex)
@@ -1121,12 +1134,8 @@ namespace DuckGodMenu
 
                     if (targetDuck.gameObject != null)
                     {
-                        if (_betterCameraMode) FollowSmooth(targetDuck.transform);
-                        else
-                        {
-                            _cachedMainCamera.transform.position = targetDuck.transform.position + new Vector3(0, 2.5f, -4f);
-                            _cachedMainCamera.transform.LookAt(targetDuck.transform);
-                        }
+                        _cachedMainCamera.transform.position = targetDuck.transform.position + new Vector3(0, 2.5f, -4f);
+                        _cachedMainCamera.transform.LookAt(targetDuck.transform);
                     }
                 }
             }
@@ -1189,44 +1198,53 @@ namespace DuckGodMenu
                     if (n > 0) geyserCenter = sum / n;
                 }
 
+                // Optimization Mode: a kacsáknak csak minden stride-adik része kap erőt egy fizikai lépésben (körbeforgó szeletek),
+                // az erő stride-szoros, így az átlagos hatás ugyanaz, de töredék annyi Il2Cpp-hívás fut.
+                int stride = OptStride();
+                _physPhase = (_physPhase + 1) % 100000;
+                float fmul = stride;
+                bool needPos = _vortexMode || (_duckMagnetActive && hasMouseWorldPos) || _geyserMode || isBlackHoleValid;
+
                 for (int i = 0; i < _cachedDucks.Count; i++)
                 {
                     DuckData duck = _cachedDucks[i];
                     if (duck.gameObject == null || duck.rigidbody == null) continue;
+                    if (stride > 1 && ((i + _physPhase) % stride) != 0) continue;
+
+                    Vector3 dpos = needPos ? duck.transform.position : Vector3.zero; // egyszer olvassuk ki (Il2Cpp-hívás)
 
                     if (gravityActive)
                     {
                         // ha a kacsán eredetileg is be volt kapcsolva a gravitáció, csak a különbözetet adjuk hozzá
                         float k = duck.origGravity ? _gravityMultiplier - 1f : _gravityMultiplier;
-                        duck.rigidbody.AddForce(worldGravity * k, ForceMode.Acceleration);
+                        duck.rigidbody.AddForce(worldGravity * (k * fmul), ForceMode.Acceleration);
                     }
 
                     if (_vortexMode)
                     {
-                        Vector3 directionToCenter = poolCenter - duck.transform.position;
+                        Vector3 directionToCenter = poolCenter - dpos;
                         directionToCenter.y = 0;
                         Vector3 tangent = Vector3.Cross(directionToCenter, Vector3.up).normalized;
-                        duck.rigidbody.AddForce((tangent * _vortexSpeed) + (directionToCenter.normalized * 2f), ForceMode.Acceleration);
+                        duck.rigidbody.AddForce(((tangent * _vortexSpeed) + (directionToCenter.normalized * 2f)) * fmul, ForceMode.Acceleration);
                     }
 
                     if (_duckMagnetActive && hasMouseWorldPos)
                     {
-                        Vector3 dirToMouse = mouseWorldPos - duck.transform.position;
-                        duck.rigidbody.AddForce(dirToMouse.normalized * 18f, ForceMode.Force);
+                        Vector3 dirToMouse = mouseWorldPos - dpos;
+                        duck.rigidbody.AddForce(dirToMouse.normalized * (18f * fmul), ForceMode.Force);
                     }
 
                     if (_geyserMode)
                     {
-                        Vector3 gp = duck.transform.position;
-                        float distFromCenter = Vector3.Distance(new Vector3(gp.x, 0, gp.z), new Vector3(geyserCenter.x, 0, geyserCenter.z));
+                        float distFromCenter = Vector3.Distance(new Vector3(dpos.x, 0, dpos.z), new Vector3(geyserCenter.x, 0, geyserCenter.z));
                         // Acceleration: a tömegtől független, és a gravitációnál (9,8) erősebb
-                        if (distFromCenter < GeyserRadius) duck.rigidbody.AddForce(Vector3.up * 22f, ForceMode.Acceleration);
+                        if (distFromCenter < GeyserRadius) duck.rigidbody.AddForce(Vector3.up * (22f * fmul), ForceMode.Acceleration);
                     }
 
                     if (isBlackHoleValid && i > 0)
                     {
-                        Vector3 dirToBlackHole = blackHolePosition - duck.transform.position;
-                        duck.rigidbody.AddForce(dirToBlackHole.normalized * 20f, ForceMode.Force);
+                        Vector3 dirToBlackHole = blackHolePosition - dpos;
+                        duck.rigidbody.AddForce(dirToBlackHole.normalized * (20f * fmul), ForceMode.Force);
                     }
                 }
 
@@ -1234,7 +1252,7 @@ namespace DuckGodMenu
                 if (_rescueLostDucks)
                 {
                     _rescueTickCounter++;
-                    if (_rescueTickCounter >= 5)
+                    if (_rescueTickCounter >= (stride > 1 ? 25 : 5))
                     {
                         _rescueTickCounter = 0;
                         RescueLostDucks();
@@ -1245,10 +1263,11 @@ namespace DuckGodMenu
                 if (_socialDistancing)
                 {
                     _distancingTickCounter++;
-                    if (_distancingTickCounter >= 3)
+                    int distEvery = stride > 1 ? 6 : 3; // Optimization Mode: ritkábban, arányosan erősebb lökéssel
+                    if (_distancingTickCounter >= distEvery)
                     {
                         _distancingTickCounter = 0;
-                        ApplySocialDistancing();
+                        ApplySocialDistancing(distEvery / 3f);
                     }
                 }
             }
@@ -1269,7 +1288,7 @@ namespace DuckGodMenu
             return ((long)(x & 0x1FFFFF) << 42) | ((long)(y & 0x1FFFFF) << 21) | (long)(z & 0x1FFFFF);
         }
 
-        private void ApplySocialDistancing()
+        private void ApplySocialDistancing(float accelMul = 1f)
         {
             // Rács ürítése, a listák visszakerülnek a készletbe
             foreach (var kv in _grid)
@@ -1337,7 +1356,7 @@ namespace DuckGodMenu
                             float dist = Mathf.Sqrt(sqrDist);
                             Vector3 pushDir = delta / dist;
                             // Acceleration: tömegfüggetlen, és az Impulse-nál jóval szelídebb (a hívás minden 3. fizikai lépésben történik)
-                            float accel = (DistancingRadius - dist) * 25f;
+                            float accel = (DistancingRadius - dist) * 25f * accelMul;
                             a.rigidbody.AddForce(pushDir * accel, ForceMode.Acceleration);
                             b.rigidbody.AddForce(-pushDir * accel, ForceMode.Acceleration);
                         }
@@ -1462,6 +1481,10 @@ namespace DuckGodMenu
                 _freeCamLooking = false;
                 _freeCamHasSaved = false;
                 _freeCamDisabled.Clear(); // a régi kamera szkriptjei már nem léteznek
+                _freeCamRigScripts.Clear();
+                _freeCamRigWasEnabled.Clear();
+                _freeCamRigSaved = false;
+                _freeCamRig = null;
                 _cachedMainCamera = cam;
             }
         }
@@ -1718,6 +1741,7 @@ namespace DuckGodMenu
         {
             if (!IsHostOrSolo()) return;
             CaptureMenuKey();
+            HandleCamKeyEvent();
             if (_screenshotMode) return;
             try
             {
@@ -1815,10 +1839,27 @@ namespace DuckGodMenu
         // és a konzolba egyszer kiírják, PONTOSAN melyik hívás nem működik ([GUI-STRIP]).
         private readonly System.Collections.Generic.HashSet<string> _failedGuiCalls = new System.Collections.Generic.HashSet<string>();
 
-        private void GuiFail(string name, System.Exception ex)
+        // Csak a ténylegesen kivágott (stripped) metódusokat tiltjuk le végleg. Más hiba (pl. IMGUI vezérlőszám-eltérés egy
+        // képkockában) átmeneti: naplózzuk, de a vezérlőtípus a továbbiakban is működik.
+        private static bool IsStripError(System.Exception ex)
         {
+            string m = ex.Message ?? "";
+            return m.IndexOf("unstripping", System.StringComparison.OrdinalIgnoreCase) >= 0
+                || ex is System.NotSupportedException
+                || ex is System.MissingMethodException;
+        }
+
+        // true = véglegesen letiltva (kivágott metódus), false = átmeneti hiba
+        private bool GuiFail(string name, System.Exception ex)
+        {
+            if (!IsStripError(ex))
+            {
+                LogErrorOnce($"[GUI] {name} átmeneti hiba (nem tiltva le): {ex.GetType().Name}: {ex.Message}");
+                return false;
+            }
             if (_failedGuiCalls.Add(name))
                 LoggerInstance.Error($"[GUI-STRIP] {name} nem működik ebben a játékban: {ex.GetType().Name}: {ex.Message}");
+            return true;
         }
 
         // Saját kurzor: fehér négyzet fekete kerettel, hogy a menü fölött mindig látszódjon,
@@ -1882,7 +1923,7 @@ namespace DuckGodMenu
                 {
                     return style != null ? GUILayout.Toggle(value, text, style) : GUILayout.Toggle(value, text);
                 }
-                catch (System.Exception ex) { GuiFail("GUILayout.Toggle", ex); }
+                catch (System.Exception ex) { if (!GuiFail("GUILayout.Toggle", ex)) return value; }
             }
             // Tartalék: ha a Toggle ki van vágva, egy gomb kapcsolja át az értéket
             if (SafeButton((value ? "[ON]  " : "[OFF] ") + text, _customBtnStyle)) return !value;
@@ -1894,7 +1935,7 @@ namespace DuckGodMenu
             if (!_failedGuiCalls.Contains("GUILayout.HorizontalSlider"))
             {
                 try { return GUILayout.HorizontalSlider(value, min, max); }
-                catch (System.Exception ex) { GuiFail("GUILayout.HorizontalSlider", ex); }
+                catch (System.Exception ex) { if (!GuiFail("GUILayout.HorizontalSlider", ex)) return value; }
             }
             // Tartalék: ha a csúszka ki van vágva, két gombbal léptethető az érték
             float step = (max - min) / 20f;
@@ -1919,6 +1960,7 @@ namespace DuckGodMenu
             bool showDebugPanel = _showDebugPanel;
             bool showRebuild = _corruptedDucksCount > 0;
             bool showFreeCamInfo = _freeCamEnabled;
+            bool showOpt = _optimizationMode;
             _secSnapshot = _openSection;
 
             SetContentColor(Color.yellow);
@@ -2062,6 +2104,8 @@ namespace DuckGodMenu
                 LoggerInstance.Msg($"[CAMERA] Kamera Követés: {(newCam ? "BE" : "KI")}");
                 if (!_cameraFollowActive) ResetCamera();
             }
+            if (showNextDuck && SafeButton(T("Previous Duck", "Előző Kacsa"), _customBtnStyle))
+                _cameraTargetIndex = _cameraTargetIndex > 0 ? _cameraTargetIndex - 1 : Mathf.Max(0, _cachedDucks.Count - 1);
             if (showNextDuck && SafeButton(T("Next Duck", "Következő Kacsa"), _customBtnStyle)) _cameraTargetIndex++;
 
             bool newFree = SafeToggle(_freeCamEnabled, T("Free Camera (Space = fly on/off)", "Szabad Kamera (Space = repülés be/ki)"));
@@ -2131,16 +2175,11 @@ namespace DuckGodMenu
                 if (!newOpt) _optStatus = "";
                 SaveModeSettings();
             }
-            if (_optimizationMode) SafeLabel(string.IsNullOrEmpty(_optStatus) ? T("Faster Disco, rarer duck scan, max 80 ESP labels, Chaos Flood stops below 25 FPS.", "Gyorsabb Disco, ritkább kacsa-keresés, max 80 ESP címke, a Káosz Özön 25 FPS alatt leáll.") : _optStatus);
+            if (showOpt) SafeLabel(string.IsNullOrEmpty(_optStatus)
+                ? T($"Level {OptStride()}x ({_cachedDucks.Count} ducks): sliced physics, rarer scans, faster Disco, max 80 ESP labels, FPS guard (25).", $"Szint {OptStride()}x ({_cachedDucks.Count} kacsa): szeletelt fizika, ritkább keresés, gyorsabb Disco, max 80 ESP címke, FPS-védelem (25).")
+                : _optStatus);
 
-            bool newCamMode = SafeToggle(_betterCameraMode, T("Better Camera Mode", "Better Camera Mode"), _customBtnStyle);
-            if (newCamMode != _betterCameraMode)
-            {
-                _betterCameraMode = newCamMode;
-                if (!newCamMode) _screenshotMode = false;
-                SaveModeSettings();
-            }
-            if (_betterCameraMode) SafeLabel(T("Smooth follow, MMB drag = orbit, wheel = zoom, PgUp/PgDn = prev/next duck, Home = auto-orbit, End = cinematic, F8 = screenshot mode.", "Simított követés, középső gomb húzás = körbeforgatás, görgő = zoom, PgUp/PgDn = előző/következő kacsa, Home = auto-körbeforgás, End = filmes mód, F8 = képernyőkép mód."));
+            if (SafeButton(T("Screenshot mode (hides ALL UI; F8 or the menu key brings it back)", "Képernyőkép mód (MINDEN felületet elrejt; F8 vagy a menü-billentyű hozza vissza)"), _customBtnStyle)) SetScreenshotMode(true);
 
 
             _chaosModeActive = SafeToggle(_chaosModeActive, T("Chaos Flood", "Káosz Özön"), _customBtnStyle);
@@ -2167,7 +2206,7 @@ namespace DuckGodMenu
                 ? $" ({T("slot", "slot")} {_forceSaveSlot})"
                 : $" ({T("creates a new slot", "új slotot hoz létre")})");
             if (SafeButton(saveLabel, _customBtnStyle)) ForceSave();
-            if (!string.IsNullOrEmpty(_saveStatus)) SafeLabel(_saveStatus);
+            SafeLabel(string.IsNullOrEmpty(_saveStatus) ? " " : _saveStatus); // mindig ugyanannyi vezérlő (IMGUI Layout/esemény egyezés)
 
             // ---- TELEMETRIA PANEL ----
             SafeSpace(5);
@@ -2507,6 +2546,7 @@ namespace DuckGodMenu
             if (_cachedMainCamera == null)
             {
                 _freeCamFlying = false;
+                EnableGameCameraScripts(); // a letiltott játék-kameraszkriptek ne maradjanak kikapcsolva
                 return;
             }
 
@@ -2768,7 +2808,8 @@ namespace DuckGodMenu
                 _cloneKnownIds = null;
                 return;
             }
-            _nextCacheUpdateTime = 0f; // még nem jelent meg, a következő képkockában újra keresünk
+            // még nem jelent meg: hamarosan újra keresünk (de nem képkockánként, a teljes keresés drága)
+            if (_nextCacheUpdateTime > Time.unscaledTime + 0.25f) _nextCacheUpdateTime = Time.unscaledTime + 0.25f;
         }
 
         // ---- Gravitációs Fegyver ----
@@ -3060,6 +3101,15 @@ namespace DuckGodMenu
             return false;
         }
 
+        private void ResetEnviroCache()
+        {
+            _enviroWeatherModule = null;
+            _enviroEnvModule = null;
+            _meteoMgr = null;
+            _meteoFrozenLogged = false;
+            _nextEnviroSearch = 0f;
+        }
+
         private void SaveOrigFog()
         {
             if (_origFogSaved) return;
@@ -3105,6 +3155,7 @@ namespace DuckGodMenu
             {
                 _weatherStatus = T("Weather change failed: ", "Időjárás-váltás sikertelen: ") + (ex.InnerException != null ? ex.InnerException.Message : ex.Message);
                 LogErrorOnce($"[WEATHER] SetWeather({key}) hiba: {ex.GetType().Name}: {ex.Message}");
+                ResetEnviroCache(); // az elavult hivatkozások (jelenetváltás) újrakeresésre kerülnek
             }
 
             // Tartalék: a köd a Unity saját ködjével is megy (a tiszta ég az eredeti ködöt állítja vissza)
@@ -3157,6 +3208,7 @@ namespace DuckGodMenu
             {
                 _weatherStatus = T("Clear weather failed: ", "Időjárás törlése sikertelen: ") + (ex.InnerException != null ? ex.InnerException.Message : ex.Message);
                 LogErrorOnce($"[WEATHER] ClearAllWeather hiba: {ex.GetType().Name}: {ex.Message}");
+                ResetEnviroCache();
             }
 
             try { RestoreOrigFog(); }
@@ -3202,8 +3254,8 @@ namespace DuckGodMenu
             new[] { "Chaos Flood", "Káosz Özön", "Spawns a duck every 0.15 s until 50 ducks exist, then switches itself off.", "0,15 másodpercenként spawnol egy kacsát, amíg 50 kacsa nincs, utána magától kikapcsol." },
             new[] { "Collection Spawner", "Collection Spawner", "With it on, clicking a duck in the game's Collection menu spawns that duck.", "Bekapcsolva a játék Collection menüjében egy kacsára kattintva az a kacsa lespawnol." },
             new[] { "Formations", "Formációk", "Circle, Line, Spiral and Tower arrange all your ducks around the point the camera is looking at.", "A Kör, Sor, Spirál és Torony a kameráddal nézett pont köré rendezi az összes kacsádat." },
-            new[] { "Optimization Mode", "Optimization Mode", "Disco updates only a quarter of the visible ducks per tick, the full duck scan runs less often with many ducks, ESP shows at most 80 labels, and Chaos Flood stops when FPS stays under 25 for 3 seconds. The setting is saved.", "A Disco tickenként csak a látható kacsák negyedét frissíti, sok kacsánál a teljes kacsa-keresés ritkábban fut, az ESP legfeljebb 80 címkét mutat, és a Káosz Özön leáll, ha az FPS 3 másodpercig 25 alatt van. A beállítás mentődik." },
-            new[] { "Better Camera Mode", "Better Camera Mode", "Camera Follow becomes smooth. Hold the middle mouse button and drag to orbit, use the wheel to zoom. PgUp/PgDn switch ducks, Home = auto-orbit, End = cinematic (random duck every 12 s). F8 hides the menu and ESP for screenshots (the menu key brings it back). The setting is saved.", "A Kamera Követés simává válik. Középső egérgomb nyomva + húzás = körbeforgatás, görgő = zoom. PgUp/PgDn = kacsaváltás, Home = auto-körbeforgás, End = filmes mód (12 mp-enként véletlen kacsa). Az F8 elrejti a menüt és az ESP-t képernyőképhez (a menü-billentyű visszahozza). A beállítás mentődik." },
+            new[] { "Optimization Mode", "Optimization Mode", "Disco updates only a quarter of the visible ducks per tick, physics forces are applied to a rotating slice of the ducks (2x above 80 ducks, 3x above 160, 4x above 240, with proportionally stronger forces), Social Distancing and Rescue run less often, the full duck scan runs less often with many ducks, ESP shows at most 80 labels, and Chaos Flood stops when FPS stays under 25 for 3 seconds. The setting is saved.", "A Disco tickenként csak a látható kacsák negyedét frissíti, a fizikai erők a kacsák egy körbeforgó szeletére hatnak (80 kacsa felett 2x, 160 felett 3x, 240 felett 4x, arányosan erősebb lökéssel), a Social Distancing és a Rescue ritkábban fut, sok kacsánál a teljes kacsa-keresés ritkábban fut, az ESP legfeljebb 80 címkét mutat, és a Káosz Özön leáll, ha az FPS 3 másodpercig 25 alatt van. A beállítás mentődik." },
+            new[] { "Screenshot mode", "Képernyőkép mód", "Hides the mod menu, the ESP and all of the game's own UI (every Canvas) so you can take clean screenshots. F8 toggles it; the menu key or F8 brings everything back.", "Elrejti a mod menüjét, az ESP-t és a játék saját felületét (minden Canvas-t), hogy tiszta képernyőképet készíthess. Az F8 be/ki kapcsolja; a menü-billentyű vagy az F8 mindent visszahoz." },
             new[] { "Multiplayer protection", "Multiplayer védelem", "While hosting, other players' ducks are not touched by the mod. The Multiplayer section lists how many ducks each owner has.", "Hostolás közben a mod nem nyúl más játékosok kacsáihoz. A Multiplayer szekció megmutatja, kinek hány kacsája van." },
             new[] { "Respawn All Ducks", "Respawn All Ducks", "Puts every duck you control onto the game's spawn point (with a small spread). Click twice to confirm.", "Minden általad kezelhető kacsát a játék spawn-pontjára tesz (kis szórással). A megerősítéshez kétszer kell kattintani." },
             new[] { "Protect selected duck", "Kijelölt kacsa védelme", "Singleplayer only. A protected duck is invisible to every mod feature (its mod changes are removed) and the game's despawn distance for it is set huge. Use the Remove buttons to undo it.", "Csak egyjátékos módban. A védett kacsát a mod egyik funkciója sem látja (a modos módosítások lekerülnek róla), és a játék despawn-távolsága rá hatalmasra van állítva. A levétel gombokkal visszavonható." },
@@ -3285,18 +3337,25 @@ namespace DuckGodMenu
             LoggerInstance.Msg("All ducks destroyed.");
         }
 
-        private System.Collections.IEnumerator FireLastDuckCoroutine()
+        // Az újonnan spawnolt kacsát lövi ki (megvárja, amíg a mod regisztrálja); ha nem jelenik meg, nem lő ki egy régit
+        private System.Collections.IEnumerator FireNewDuckCoroutine(HashSet<int> known)
         {
-            yield return null; // 1 képkocka: nem függ a Time.timeScale-től (0-s timeScale-nél sem akad el)
-            UpdateDuckCache();
-            if (_cachedMainCamera == null) UpdateCameraCache();
-            if (_cachedDucks.Count > 0)
+            for (int frame = 0; frame < 40; frame++)
             {
-                var lastDuck = _cachedDucks[_cachedDucks.Count - 1];
-                if (lastDuck.rigidbody != null && _cachedMainCamera != null)
+                yield return null; // nem függ a Time.timeScale-től
+                if (frame % 4 != 3) continue;
+                UpdateDuckCache();
+                if (_cachedMainCamera == null) UpdateCameraCache();
+                for (int i = _cachedDucks.Count - 1; i >= 0; i--)
                 {
-                    Ray ray = _cachedMainCamera.ScreenPointToRay(Input.mousePosition);
-                    lastDuck.rigidbody.AddForce(ray.direction.normalized * 45f, ForceMode.VelocityChange);
+                    DuckData d = _cachedDucks[i];
+                    if (d.gameObject == null || known.Contains(d.id)) continue;
+                    if (d.rigidbody != null && _cachedMainCamera != null)
+                    {
+                        Ray ray = _cachedMainCamera.ScreenPointToRay(Input.mousePosition);
+                        d.rigidbody.AddForce(ray.direction.normalized * 45f, ForceMode.VelocityChange);
+                    }
+                    yield break;
                 }
             }
         }
