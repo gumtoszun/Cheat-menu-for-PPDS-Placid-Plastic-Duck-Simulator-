@@ -1,4 +1,4 @@
-This mod is for PPDS(Placid Plastic Duck Simulator) this is a cheat menu features the cheat menu has:
+F9 to open/close This mod is for PPDS(Placid Plastic Duck Simulator) this is a cheat menu features the cheat menu has:
 
 
 
